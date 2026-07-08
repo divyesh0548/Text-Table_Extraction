@@ -1,0 +1,69 @@
+# Ignore everything by default
+*
+
+# Allow directory traversal
+!*/
+
+# Only include Python programs and text files
+!*.py
+!*.txt
+
+# Keep this file tracked
+!.gitignore
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+
+# General cache files
+.cache/
+*.cache
+.webassets-cache
+.ipynb_checkpoints/
+
+# Excel files
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.xltx
+*.xltm
+*.csv
+
+# PDF files
+*.pdf
+
+# Image files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+*.tiff
+*.tif
+*.svg
+*.ico
+*.heic
+*.avif
+
+# Environment and secrets
+venv/
+.env
+.env.*
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# System files
+.DS_Store
+Thumbs.db

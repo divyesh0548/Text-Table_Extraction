@@ -1,0 +1,9 @@
+This pdfs have some kind of metadata that restricts text extraction from some pages.
+
+I tried converting them to images first to bypass that restriction. And then use ocr to extract tables. Accuracy is low but working on it.
+
+Covert them to images and then into pdfs to bypass metadata restriction.
+
+Table extraction from images is not good as it adds some noise.
+
+Converted pdfs from images but camelot only works on digital documents.

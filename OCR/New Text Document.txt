@@ -1,0 +1,52 @@
+
+Tasks:
+Remove unnecessary data.
+
+Separate rows by unique numbers, for example UAN.
+
+Give an option of uploading a folder with multiple files. And merge table data in a single excel sheet with a column indicating files names. (later on)
+
+Leave scanned pdfs for now. Just work on digital pdfs.
+
+Add another column besides table that shows file name, as well as a date if available.
+
+Find a way to remove watermarak from pdf for sample7.pdf
+
+Create a separate column for GST seller and buyer. Also Bill NO, Bill Date, Bill for the Month of, PAN, etc. Keep these columns besides table and repeat them.
+Sir told today : Name, address and buyer's GST will be at same place. Just try to extract different elements for now.
+
+Find a way to make table borders bold, for better table detection.
+
+Also change the way Easyocr is extracting table. Separate rows in different line.
+
+
+
+Issues:
+Easyocr program is not working on my laptop due to higher requirement.
+
+
+Done:
+
+Converted images and then into pdfs to bypass metadata restriction.
+Table extraction from images is not good as it adds some noise.
+Converted pdfs from images but Camelot only works on digital documents.
+Found a way to remove restriction using python. Now Camelot is able to extract whole table but with minimal structure. I will have to manage it manually.
+
+Pytesserect can extract text but table structure is not there.
+
+Solved empty columns problems.
+
+ESIC is done.
+
+ECR is done.
+
+HDFC is done. (Minor problems)  (Adding page number is creating problems)
+
+Bank Transfer is done.
+
+BOB Bank statement done.
+
+Still not able to find a solution for HDFC bank statements ---> Finally got the some results. only structure is remaining. --> Finally I was able to extract table with minor issues using PDFplumber.
+
+AWS code is working with api key.
+

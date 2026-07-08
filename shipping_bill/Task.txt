@@ -1,0 +1,64 @@
+Page 1 --> All Data
+
+Page 2 --> Last whole table.  (Marking : C.VAL DTLS)
+
+Page 3 --> All ITEM Details
+
+RODTEP Details (maybe on page 4 or 5)
+
+Also fetch Invoice No.
+
+
+I want some specific data in my excel sheet. So now I want you to perform data removal on the final excel sheet. Do not change the logic of data extraction. Perform this on final excel file.
+
+I have attached all the necessary files. 
+
+Remove this text fields. 
+
+"""INDIAN CUSTOMS EDI SYSTEM CENTRAL BOARD OF INDIRECT TAXES AND CUSTOMS DEPARTMENT OF REVENUE - MINISTRY OF FINANCE GOVERNMENT OF INDIA"""
+
+""1.MODE
+2.ASSESS
+3.EXMN
+4.JOBBING
+5.MEIS
+6.DBK
+7.RODTP
+8.LICENCE
+9.DFRC
+10.RE-EXP
+11.LUT"""
+
+"""PART - I - SHIPPING BILL SUMMARY"""
+
+"""STATUS
+A
+
+B DECLARAN
+DETAILS
+
+C.VALU
+SUMMA
+
+E MANIFEST
+DETAILS
+
+G. EQUIPMENT
+DETAILS
+
+I. ANNEX
+DETAILS
+
+J.PROCESS
+DETAILS"""
+
+"""D.
+EX.PR.
+
+F.INVOICE
+SUMMARY
+
+CHALLAN DETAILS
+H"""
+
+"Glossary details" (Last item of every sheet, so remove all content after the word "Glossary")
