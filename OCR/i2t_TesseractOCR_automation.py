@@ -118,7 +118,7 @@ def get_user_input():
     # Get input path
     # input_path = input("Enter the path to your PDF or image file: ").strip()
     # input_path = "CH-012026-0062-INVOICE.pdf"
-    input_path = "Current-Test/MBP 1 AKB 2026.pdf"
+    input_path = "Current-Test/MBP 1 GG 2026.pdf"
 
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {Path(input_path).resolve()}")
@@ -231,17 +231,59 @@ def rotate_image_file(image_path, rotation_info):
         return image_path
 
 
+def _enhance_table_page_bgr(img_bgr: np.ndarray, line_strength: int = 2) -> np.ndarray:
+    """
+    Strengthen table grid lines while preserving text for OCR.
+
+    Previous logic used strong contrast/blur and masked line regions in a way
+    that erased or damaged glyphs near borders, which made Tesseract struggle.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # OCR-friendly text base: light edge-preserving denoise + local contrast
+    text_base = cv2.bilateralFilter(gray, d=5, sigmaColor=45, sigmaSpace=45)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    text_base = clahe.apply(text_base)
+
+    # Detect lines from a separate binary image (do not reuse text_base as output mask)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    thresh = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        15,
+        10,
+    )
+
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+    detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+
+    table_mask = cv2.add(detect_horizontal, detect_vertical)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(1, line_strength), max(1, line_strength))
+    )
+    # One dilate pass: thicken lines for table detection without eating nearby text
+    table_mask = cv2.dilate(table_mask, kernel, iterations=1)
+    table_mask = cv2.morphologyEx(table_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # Draw black grid lines on top of the preserved text image
+    enhanced = text_base.copy()
+    enhanced[table_mask > 0] = 0
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+
 def enhance_pdf_tables(pdf_path, dpi=300, line_strength=2, show_progress=True):
-    """Enhanced PDF table enhancement function"""
+    """Enhance PDF table grid lines without destroying text for OCR."""
     if show_progress:
         print(f"\n[ENHANCE] Starting PDF enhancement...")
 
-    # Temporary folder for page images
     temp_dir = "temp_pdf_images"
     os.makedirs(temp_dir, exist_ok=True)
 
     try:
-        # Convert PDF pages to images
         pages = convert_from_path(pdf_path, dpi=dpi)
         enhanced_images = []
 
@@ -249,53 +291,14 @@ def enhance_pdf_tables(pdf_path, dpi=300, line_strength=2, show_progress=True):
             if show_progress:
                 print(f"[ENHANCE] Processing page {i+1}/{len(pages)}...")
 
-            # Convert PIL image to OpenCV format
-            img = np.array(page)
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            img = cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR)
+            enhanced_bgr = _enhance_table_page_bgr(img, line_strength=line_strength)
 
-            # --- Step 1: Grayscale ---
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            # --- Step 2: Improve contrast ---
-            gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
-
-            # --- Step 3: Reduce noise ---
-            gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-            # --- Step 4: Adaptive threshold ---
-            thresh = cv2.adaptiveThreshold(
-                gray, 255,
-                cv2.ADAPTIVE_THRESH_MEAN_C,
-                cv2.THRESH_BINARY_INV,
-                15, 10
-            )
-
-            # --- Step 5: Detect horizontal & vertical lines ---
-            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-
-            detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-            detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
-
-            # --- Step 6: Combine and strengthen lines ---
-            table_mask = cv2.add(detect_horizontal, detect_vertical)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (line_strength, line_strength))
-            table_mask = cv2.dilate(table_mask, kernel, iterations=2)
-
-            # --- Step 7: Smooth edges and repair small gaps ---
-            table_mask = cv2.morphologyEx(table_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-            # --- Step 8: Invert and merge with original ---
-            inverted_mask = cv2.bitwise_not(table_mask)
-            enhanced_gray = cv2.bitwise_and(gray, gray, mask=inverted_mask)
-            enhanced_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
-
-            # Save temporary enhanced image
             enhanced_path = os.path.join(temp_dir, f"enhanced_page_{i+1}.png")
             cv2.imwrite(enhanced_path, enhanced_bgr)
-            enhanced_images.append(Image.open(enhanced_path).convert("RGB"))
+            with Image.open(enhanced_path) as enhanced_img:
+                enhanced_images.append(enhanced_img.convert("RGB"))
 
-        # --- Step 9: Save final enhanced PDF ---
         base_name = os.path.splitext(os.path.basename(pdf_path))[0]
         pdf_output_path = os.path.join(os.getcwd(), f"{base_name}_enhanced.pdf")
         enhanced_images[0].save(pdf_output_path, save_all=True, append_images=enhanced_images[1:])
@@ -311,7 +314,7 @@ def enhance_pdf_tables(pdf_path, dpi=300, line_strength=2, show_progress=True):
 
 
 def enhance_image_tables(image_path, line_strength=2, show_progress=True):
-    """Enhance an image before table extraction"""
+    """Enhance an image table grid while preserving text for OCR."""
     if show_progress:
         print(f"\n[ENHANCE] Starting image enhancement...")
 
@@ -320,31 +323,7 @@ def enhance_image_tables(image_path, line_strength=2, show_progress=True):
         if img is None:
             raise ValueError(f"Could not read image: {image_path}")
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-        thresh = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY_INV,
-            15, 10
-        )
-
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-
-        detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-        detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
-
-        table_mask = cv2.add(detect_horizontal, detect_vertical)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (line_strength, line_strength))
-        table_mask = cv2.dilate(table_mask, kernel, iterations=2)
-        table_mask = cv2.morphologyEx(table_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        inverted_mask = cv2.bitwise_not(table_mask)
-        enhanced_gray = cv2.bitwise_and(gray, gray, mask=inverted_mask)
-        enhanced_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+        enhanced_bgr = _enhance_table_page_bgr(img, line_strength=line_strength)
 
         input_path = Path(image_path)
         output_path = input_path.with_name(f"{input_path.stem}_enhanced{input_path.suffix}")
@@ -491,8 +470,8 @@ def _patch_img2table_cell_word_order() -> None:
     OCRDataframe.get_text_table = get_text_table
 
 
-def reduce_pdf_resolution(input_pdf_path, target_dpi=72):
-    """Reduce PDF resolution"""
+def reduce_pdf_resolution(input_pdf_path, target_dpi=30):
+    """Reduce PDF resolution after enhancement (lower DPI = smaller pages)."""
     print(f"\n[REDUCE] Reducing PDF resolution to {target_dpi} DPI...")
 
     try:
@@ -502,16 +481,16 @@ def reduce_pdf_resolution(input_pdf_path, target_dpi=72):
 
         for i, img in enumerate(images):
             # Calculate new size based on target DPI and original DPI
-            orig_dpi = img.info.get('dpi', (300,300))[0]
+            orig_dpi = img.info.get('dpi', (300, 300))[0]
             scale_factor = target_dpi / orig_dpi
-            new_size = (int(img.width * scale_factor), int(img.height * scale_factor))
+            new_size = (max(1, int(img.width * scale_factor)), max(1, int(img.height * scale_factor)))
 
             # Resize image to new target resolution
             reduced_img = img.resize(new_size, Image.LANCZOS)
 
             # Save reduced image temporarily in JPEG format to reduce size
             temp_img_path = f"temp_page_{i}.jpg"
-            reduced_img.save(temp_img_path, "JPEG", quality=85)
+            reduced_img.save(temp_img_path, "JPEG", quality=95)
             reduced_images.append(temp_img_path)
 
         # Convert list of JPEG images back to PDF

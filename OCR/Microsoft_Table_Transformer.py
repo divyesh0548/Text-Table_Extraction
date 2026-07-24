@@ -19,9 +19,10 @@ from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 # CONFIGURATION
 # =============================================================================
 
-INPUT_PDF = Path("Current-Test/MBP 1 AKB 2026.pdf")
+INPUT_PDF = Path("Current-Test/MBP 1 MK 2026.pdf")
+# INPUT_PDF = Path("MBP 1 GG 2026_enhanced_reduced.pdf")
 OUTPUT_XLSX = Path("extracted_tables.xlsx")
-DEBUG_DIR = Path("table_debug")
+DEBUG_DIR = Path(__file__).resolve().parent / "table_debug"
 
 DETECTION_MODEL_NAME = "microsoft/table-transformer-detection"
 STRUCTURE_MODEL_NAME = (
@@ -180,6 +181,11 @@ class TableTransformerEngine:
         self.structure_processor = AutoImageProcessor.from_pretrained(
             STRUCTURE_MODEL_NAME
         )
+        # transformers>=4.4x expects both shortest_edge and longest_edge.
+        # v1.1 structure configs only ship longest_edge and crash on resize.
+        self._normalize_processor_size(self.detection_processor)
+        self._normalize_processor_size(self.structure_processor)
+
         self.structure_model = (
             TableTransformerForObjectDetection.from_pretrained(
                 STRUCTURE_MODEL_NAME
@@ -187,6 +193,24 @@ class TableTransformerEngine:
             .to(self.device)
             .eval()
         )
+
+    @staticmethod
+    def _normalize_processor_size(processor) -> None:
+        size = getattr(processor, "size", None)
+        if not isinstance(size, dict):
+            return
+
+        if "shortest_edge" in size and "longest_edge" in size:
+            return
+        if "height" in size and "width" in size:
+            return
+
+        longest = int(size.get("longest_edge") or size.get("max_size") or 800)
+        shortest = int(size.get("shortest_edge") or min(800, longest))
+        processor.size = {
+            "shortest_edge": shortest,
+            "longest_edge": longest,
+        }
 
     @staticmethod
     def _decode_results(
@@ -724,6 +748,7 @@ def extract_tables_from_pdf(
                 DEBUG_DIR
                 / f"page_{page_number}_table_{table_number}.png"
             )
+            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
             table_image.save(table_crop_path)
 
             structure = engine.recognize_structure(table_image)
@@ -731,16 +756,17 @@ def extract_tables_from_pdf(
                 structure
             )
 
+            structure_debug_path = DEBUG_DIR / (
+                f"page_{page_number}_table_{table_number}"
+                "_structure.png"
+            )
+            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
             save_structure_debug_image(
                 table_image,
                 rows,
                 columns,
                 spans,
-                DEBUG_DIR
-                / (
-                    f"page_{page_number}_table_{table_number}"
-                    "_structure.png"
-                ),
+                structure_debug_path,
             )
 
             if not rows or not columns:
