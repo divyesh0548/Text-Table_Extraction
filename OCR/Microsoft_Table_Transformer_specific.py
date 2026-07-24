@@ -19,7 +19,7 @@ from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 # CONFIGURATION
 # =============================================================================
 
-INPUT_PDF = Path("Current-Test/MBP 1 MK 2026.pdf")
+INPUT_PDF = Path("Current-Test/MBP_1_CRA.pdf")
 # INPUT_PDF = Path("MBP 1 GG 2026_enhanced_reduced.pdf")
 OUTPUT_XLSX = Path("extracted_tables.xlsx")
 DEBUG_DIR = Path(__file__).resolve().parent / "table_debug"
@@ -351,6 +351,190 @@ def default_ocr(cell_image: Image.Image) -> str:
     ]
 
     return "\n".join(normalized_lines).strip()
+
+
+def is_probable_ocr_noise(line: str) -> bool:
+    """Identify OCR fragments without removing normal cell values."""
+    tokens = re.findall(r"[A-Za-z0-9]+", line.lower())
+    if not tokens:
+        # Symbols-only cells such as "{" are not real table values.
+        return bool(line.strip())
+
+    if all(token.isdigit() for token in tokens):
+        return False
+
+    # Keep common short, valid forms such as "Mr. A. B.".
+    if tokens[0] in {"mr", "mrs", "ms", "dr"}:
+        return False
+
+    # Single short alphabetic token from a phantom/narrow column (e.g. ira, ode).
+    if len(tokens) == 1:
+        token = tokens[0]
+        if token.isdigit():
+            return False
+        return len(token) <= 3
+
+    if len(tokens) < 3:
+        # Two short leftovers such as "fe i" / "ae fe".
+        return all(len(token) <= 3 for token in tokens)
+
+    lengths = [len(token) for token in tokens]
+    if max(lengths) <= 2:
+        return True
+
+    # Examples: "i. tae ee" and similar short, disconnected fragments.
+    protected_words = {"and", "the", "for", "not", "yes", "nil"}
+    return (
+        max(lengths) <= 3
+        and sum(length <= 2 for length in lengths) >= 2
+        and not any(token in protected_words for token in tokens)
+    )
+
+
+def cleanup_extracted_cell_text(value: str | None) -> str:
+    """Remove OCR-only symbols and clearly meaningless text lines."""
+    text = str(value or "")
+    # Vertical grid lines are OCR artefacts, not table content.
+    text = re.sub(r"[|¦\u2502\u2503\u2551\u254E\u254F]+", " ", text)
+
+    kept_lines = []
+    for line in text.splitlines():
+        normalized = " ".join(line.split())
+        if normalized and not is_probable_ocr_noise(normalized):
+            kept_lines.append(normalized)
+    return "\n".join(kept_lines).strip()
+
+
+def has_meaningful_cell_content(value: str | None) -> bool:
+    """Return whether a cleaned cell contains real table content."""
+    text = cleanup_extracted_cell_text(value)
+    if not text:
+        return False
+
+    words = re.findall(r"[A-Za-z]+", text)
+    # Prefer real words; 3-letter lowercase OCR crumbs are not enough alone.
+    if any(len(word) >= 4 for word in words):
+        return True
+
+    # Allow uppercase codes such as INR / USA / HUF.
+    if any(len(word) == 3 and word.isupper() for word in words):
+        return True
+
+    protected = {
+        "and", "the", "for", "not", "yes", "nil", "ltd", "pvt", "huf",
+        "mr", "mrs", "ms", "dr", "no", "sr",
+    }
+    if any(word.lower() in protected for word in words):
+        return True
+
+    # Do not discard a valid date, amount, percentage, or other numeric field
+    # merely because its column header was missed by OCR.
+    return bool(
+        re.fullmatch(r"[\d\s,./:%()\-]+", text)
+        and re.search(r"\d", text)
+    )
+
+
+def _column_values(data: list[list[str]], column_index: int) -> list[str]:
+    return [
+        row[column_index] if column_index < len(row) else ""
+        for row in data
+    ]
+
+
+def is_junk_generated_column(values: list[str]) -> bool:
+    """
+    Detect phantom columns created from grid-line OCR crumbs.
+
+    Typical pattern: empty header + short fragments (ira / fe / mit / ode).
+    """
+    if not values:
+        return True
+
+    header = cleanup_extracted_cell_text(values[0])
+    body = values[1:] if len(values) > 1 else []
+
+    meaningful_body = [
+        cell for cell in body if has_meaningful_cell_content(cell)
+    ]
+    if meaningful_body:
+        return False
+
+    # No meaningful body cells. Drop when header is also empty/noise, or when
+    # the body only had short fragments / empties.
+    if not header:
+        return True
+
+    # Header exists but body is empty/noise — still drop narrow phantom cols
+    # whose "header" is itself a short OCR crumb.
+    return is_probable_ocr_noise(header) or len(header) <= 3
+
+
+def prune_generated_columns(
+    data: list[list[str]],
+    merge_ranges: list[tuple[int, int, int, int]],
+    ) -> tuple[list[list[str]], list[tuple[int, int, int, int]]]:
+    """Drop non-index columns containing only empty or OCR-noise values."""
+    if not data or not data[0]:
+        return data, merge_ranges
+
+    column_count = len(data[0])
+    if column_count <= 1:
+        return data, merge_ranges
+
+    # The first column is normally the serial/index column and is always kept.
+    keep_indices = [0]
+    for column_index in range(1, column_count):
+        values = _column_values(data, column_index)
+        if is_junk_generated_column(values):
+            continue
+        if any(has_meaningful_cell_content(cell) for cell in values):
+            keep_indices.append(column_index)
+
+    if len(keep_indices) == column_count:
+        return data, merge_ranges
+
+    index_map = {
+        old_index: new_index
+        for new_index, old_index in enumerate(keep_indices)
+    }
+    new_data = [
+        [row[index] if index < len(row) else "" for index in keep_indices]
+        for row in data
+    ]
+
+    new_merges: list[tuple[int, int, int, int]] = []
+    for row_start, row_end, column_start, column_end in merge_ranges:
+        mapped_columns = [
+            index_map[index]
+            for index in range(column_start, column_end + 1)
+            if index in index_map
+        ]
+        if not mapped_columns:
+            continue
+
+        # Preserve text from a merged-cell anchor if its original column was
+        # removed and the merge still has a retained column.
+        if (
+            column_start not in index_map
+            and row_start < len(data)
+            and column_start < len(data[row_start])
+        ):
+            new_data[row_start][mapped_columns[0]] = data[row_start][column_start]
+
+        new_merges.append(
+            (
+                row_start,
+                row_end,
+                min(mapped_columns),
+                max(mapped_columns),
+            )
+        )
+
+    print(
+        f"  Removed {column_count - len(keep_indices)} empty/noise column(s)."
+    )
+    return new_data, new_merges
 
 
 # Example adapter for your existing OCR:
@@ -783,6 +967,11 @@ def extract_tables_from_pdf(
                 spans,
                 ocr_function,
             )
+            data = [
+                [cleanup_extracted_cell_text(value) for value in row]
+                for row in data
+            ]
+            data, merge_ranges = prune_generated_columns(data, merge_ranges)
 
             write_table_sheet(
                 workbook,
@@ -794,7 +983,7 @@ def extract_tables_from_pdf(
             extracted_table_count += 1
             print(
                 f"  Extracted table {table_number}: "
-                f"{len(rows)} row(s), {len(columns)} column(s)."
+                f"{len(rows)} row(s), {len(data[0]) if data else 0} column(s)."
             )
 
     if extracted_table_count == 0:

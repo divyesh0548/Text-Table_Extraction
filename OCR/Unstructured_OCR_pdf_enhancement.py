@@ -17,7 +17,7 @@ warnings.filterwarnings('ignore')
 unstructured_pytesseract.pytesseract.tesseract_cmd = r'C:\Users\Divyesh Parmar\Downloads\Tesserect OCR\tesseract.exe'
 
 # ========== CONFIGURATION ==========
-PDF_PATH = "CH-012026-0062-INVOICE.pdf"  # relative to current working directory
+PDF_PATH = "Current-Test/MBP_1_PCA.pdf"  # relative to current working directory
 PAGES_TO_PROCESS = "1"           # None for all pages, or e.g. "1,3-5"
 ROTATE_PDF = False
 ROTATION_PAGES = None            # None to use processed pages, or e.g. "1,2"

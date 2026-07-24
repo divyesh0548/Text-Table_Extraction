@@ -12,8 +12,8 @@ from paddleocr import TableStructureRecognition
 from table_structure_visualizer import build_cell_layout, parse_table_rows
 from table_structure_visualizer import visualize_result
 
-INPUT_SOURCE = "page_1_table_crop.png"
-# INPUT_SOURCE = "CH-012026-0062-INVOICE.pdf"
+# INPUT_SOURCE = "page_1_table_crop.png"
+INPUT_SOURCE = "Current-Test/MBP 1 AKB 2026.pdf"
 OUTPUT_DIR = Path("./output")
 PDF_RENDER_DPI = 300
 

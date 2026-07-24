@@ -19,7 +19,7 @@ pd.set_option("display.max_columns", 500)
 pd.set_option("display.width", 1000)
 
 # INPUT_SOURCE = Path("./page_1.png")
-INPUT_SOURCE = Path("Current-Test/MBP 1 AKB 2026.pdf")
+INPUT_SOURCE = Path("Current-Test/MBP_1_RKB.pdf")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 PDF_RENDER_DPI = 300
 
@@ -248,56 +248,125 @@ def load_table_model() -> YOLO:
     with torch.serialization.safe_globals([ultralytics.nn.tasks.DetectionModel]):
         model = YOLO("keremberke/yolov8m-table-extraction")
 
-    model.overrides["conf"] = 0.25
-    model.overrides["iou"] = 0.45
+    # Keep enough detections for multi-table pages; avoid over-aggressive NMS.
+    model.overrides["conf"] = 0.20
+    model.overrides["iou"] = 0.50
     model.overrides["agnostic_nms"] = False
-    model.overrides["max_det"] = 1000
+    model.overrides["max_det"] = 100
     return model
+
+
+def _box_iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def collect_table_boxes(result, iou_dedupe: float = 0.70) -> list[tuple[int, int, int, int, float]]:
+    """
+    Return all table boxes for a page: (x1, y1, x2, y2, confidence),
+    sorted top-to-bottom then left-to-right, with near-duplicates removed.
+    """
+    boxes_tensor = result.boxes.data
+    if boxes_tensor is None or len(boxes_tensor) == 0:
+        return []
+
+    raw_boxes: list[tuple[int, int, int, int, float]] = []
+    for row in boxes_tensor.cpu().numpy():
+        x1, y1, x2, y2, conf = (float(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        raw_boxes.append((int(x1), int(y1), int(x2), int(y2), conf))
+
+    # Keep highest-confidence box when two detections heavily overlap.
+    raw_boxes.sort(key=lambda item: item[4], reverse=True)
+    kept: list[tuple[int, int, int, int, float]] = []
+    for box in raw_boxes:
+        if any(_box_iou(box[:4], existing[:4]) >= iou_dedupe for existing in kept):
+            continue
+        kept.append(box)
+
+    # Reading order for stable sheet naming / processing.
+    kept.sort(key=lambda item: (item[1], item[0]))
+    return kept
 
 
 def process_image(image: Path, model: YOLO) -> None:
     excel_output = image.with_name(f"{image.stem}_ocr_output.xlsx")
     detection_output = image.with_name(f"{image.stem}_table_detection.png")
-    cropped_output = image.with_name(f"{image.stem}_table_crop.png")
 
     img = Image.open(image).convert("RGB")
     results = model.predict(img)
-    if len(results[0].boxes.data) == 0:
+    table_boxes = collect_table_boxes(results[0])
+    if not table_boxes:
         print(f"No table detections found in: {image}")
         return
 
+    print(f"Detected {len(table_boxes)} table(s) in: {image.name}")
     print("Boxes: ", results[0].boxes)
     render_result(model=model, image=img, result=results[0])
 
-    x1, y1, x2, y2, _, _ = tuple(int(item) for item in results[0].boxes.data.numpy()[0])
     annotated_image = img.copy()
     draw = ImageDraw.Draw(annotated_image)
-    draw.rectangle([x1, y1, x2, y2], outline="red", width=4)
+    for table_index, (x1, y1, x2, y2, conf) in enumerate(table_boxes, start=1):
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=4)
+        draw.text((x1 + 4, max(0, y1 - 14)), f"T{table_index} {conf:.2f}", fill="red")
     annotated_image.save(detection_output)
 
     image_array = np.array(img)
-    cropped_image = image_array[y1:y2, x1:x2]
-    cropped_image = Image.fromarray(cropped_image)
-    cropped_image.save(cropped_output)
-
-    ext_df = pytesseract.image_to_data(cropped_image, output_type=Output.DATAFRAME, config="--psm 6 --oem 3")
-    ext_df = ext_df.fillna("")
-    structured_df = build_structured_table(ext_df, np.array(cropped_image))
+    extracted_count = 0
 
     with pd.ExcelWriter(excel_output, engine="openpyxl") as writer:
-        if not structured_df.empty:
-            structured_df.to_excel(writer, sheet_name="structured_table", index=False)
-        ext_df.to_excel(writer, sheet_name="raw_ocr", index=False)
+        for table_index, (x1, y1, x2, y2, conf) in enumerate(table_boxes, start=1):
+            cropped_output = image.with_name(f"{image.stem}_table_{table_index}_crop.png")
+            cropped_array = image_array[y1:y2, x1:x2]
+            if cropped_array.size == 0:
+                print(f"  Skipped table {table_index}: empty crop.")
+                continue
 
-    print(ext_df)
-    if structured_df.empty:
-        print("Structured table reconstruction was not confident; raw OCR sheet was still saved.")
-    else:
-        print("\nStructured table preview:")
-        print(structured_df)
+            cropped_image = Image.fromarray(cropped_array)
+            cropped_image.save(cropped_output)
+
+            ext_df = pytesseract.image_to_data(
+                cropped_image,
+                output_type=Output.DATAFRAME,
+                config="--psm 6 --oem 3",
+            )
+            ext_df = ext_df.fillna("")
+            structured_df = build_structured_table(ext_df, np.array(cropped_image))
+
+            sheet_structured = f"T{table_index}_structured"[:31]
+            sheet_raw = f"T{table_index}_raw_ocr"[:31]
+            if not structured_df.empty:
+                structured_df.to_excel(writer, sheet_name=sheet_structured, index=False)
+            ext_df.to_excel(writer, sheet_name=sheet_raw, index=False)
+
+            extracted_count += 1
+            print(
+                f"  Table {table_index}/{len(table_boxes)} "
+                f"(conf={conf:.2f}) -> {cropped_output.name}"
+            )
+            if structured_df.empty:
+                print("    Structured reconstruction was not confident; raw OCR sheet saved.")
+            else:
+                print("    Structured table preview:")
+                print(structured_df)
+
+    print(f"Extracted {extracted_count} table(s) from {image.name}")
     print(f"Excel output saved to: {excel_output.resolve()}")
     print(f"Detection image saved to: {detection_output.resolve()}")
-    print(f"Cropped table image saved to: {cropped_output.resolve()}")
 
 
 def main() -> None:
