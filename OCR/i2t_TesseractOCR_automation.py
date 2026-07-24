@@ -3,11 +3,18 @@ import cv2
 import fitz
 import shutil
 import numpy as np
+from pathlib import Path
+from typing import Optional
+
+import polars as pl
 from pdf2image import convert_from_path
 from PIL import Image
 import img2pdf
 from img2table.ocr import TesseractOCR
-from img2table.document import PDF
+from img2table.ocr.data import OCRDataframe
+from img2table.document import PDF, Image as Img2TableImage
+from img2table.tables.objects.cell import Cell
+from img2table.tables.objects.table import Table
 import pandas as pd
 
 # OpenCV ximgproc compatibility patches
@@ -32,6 +39,18 @@ if not hasattr(cv2.ximgproc, "BINARIZATION_NIBLACK"):
 
 if not hasattr(cv2.ximgproc, "BINARIZATION_SAUVOLA"):
     cv2.ximgproc.BINARIZATION_SAUVOLA = 1
+
+
+PDF_EXTENSIONS = {'.pdf'}
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
+
+
+def is_pdf_file(file_path):
+    return Path(file_path).suffix.lower() in PDF_EXTENSIONS
+
+
+def is_image_file(file_path):
+    return Path(file_path).suffix.lower() in IMAGE_EXTENSIONS
 
 
 def cleanup_temp_files():
@@ -94,28 +113,54 @@ def parse_page_input(page_input, total_pages):
 
 def get_user_input():
     """Get all user inputs at the beginning"""
-    print("=== PDF Table Extraction Automation with TesseractOCR ===\n")
+    print("=== Table Extraction Automation with TesseractOCR ===\n")
 
-    # Get PDF path
-    # pdf_path = input("Enter the path to your PDF file: ").strip()
-    pdf_path = "current_test/CH-012026-0062-INVOICE.pdf"
+    # Get input path
+    # input_path = input("Enter the path to your PDF or image file: ").strip()
+    # input_path = "CH-012026-0062-INVOICE.pdf"
+    input_path = "Current-Test/MBP 1 AKB 2026.pdf"
 
-    total_pages = get_pdf_page_count(pdf_path)
-    print(f"\nDetected {total_pages} pages in the PDF")
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {Path(input_path).resolve()}")
 
-    # Get pages to process
-    page_input = input(f"Enter pages to process (1-{total_pages}, e.g., '1,3-5') or press Enter for all: ").strip()
-    pages_to_process = parse_page_input(page_input, total_pages) if page_input else None
+    if not (is_pdf_file(input_path) or is_image_file(input_path)):
+        raise ValueError("Unsupported input format. Use PDF, PNG, JPG, JPEG, BMP, TIF, or TIFF.")
 
-    # Get rotation preferences
-    rotate_pdf = input("\nDo you want to rotate PDF pages? (y/n): ").strip().lower() == 'y'
+    pages_to_process = None
     rotation_info = {}
 
-    if rotate_pdf:
-        rotation_pages_input = input("Enter pages to rotate (same format as above) or press Enter for all processed pages: ").strip()
-        rotation_pages = parse_page_input(rotation_pages_input, total_pages) if rotation_pages_input else pages_to_process
+    if is_pdf_file(input_path):
+        total_pages = get_pdf_page_count(input_path)
+        print(f"\nDetected {total_pages} pages in the PDF")
 
-        if rotation_pages:
+        page_input = input(f"Enter pages to process (1-{total_pages}, e.g., '1,3-5') or press Enter for all: ").strip()
+        pages_to_process = parse_page_input(page_input, total_pages) if page_input else None
+
+        rotate_input = "\nDo you want to rotate PDF pages? (y/n): "
+    else:
+        print("\nDetected image input")
+        rotate_input = "\nDo you want to rotate the image? (y/n): "
+
+    rotate_input_file = input(rotate_input).strip().lower() == 'y'
+
+    if rotate_input_file:
+        if is_pdf_file(input_path):
+            rotation_pages_input = input("Enter pages to rotate (same format as above) or press Enter for all processed pages: ").strip()
+            rotation_pages = parse_page_input(rotation_pages_input, total_pages) if rotation_pages_input else pages_to_process
+
+            if rotation_pages:
+                while True:
+                    try:
+                        rotation_angle = int(input("Enter rotation angle (90, 180, 270, -90): "))
+                        if rotation_angle in [90, 180, 270, -90]:
+                            break
+                        else:
+                            print("Please enter a valid rotation angle (90, 180, 270, -90)")
+                    except ValueError:
+                        print("Please enter a valid number")
+
+                rotation_info = {'pages': rotation_pages, 'angle': rotation_angle}
+        else:
             while True:
                 try:
                     rotation_angle = int(input("Enter rotation angle (90, 180, 270, -90): "))
@@ -126,12 +171,12 @@ def get_user_input():
                 except ValueError:
                     print("Please enter a valid number")
 
-            rotation_info = {'pages': rotation_pages, 'angle': rotation_angle}
+            rotation_info = {'angle': rotation_angle}
 
-    # Get enhancement preference
-    enhance_pdf = input("\nDo you want to enhance the PDF? (y/n): ").strip().lower() == 'y'
+    enhance_input = "\nDo you want to enhance the input before extraction? (y/n): "
+    enhance_input_file = input(enhance_input).strip().lower() == 'y'
 
-    return pdf_path, pages_to_process, rotation_info, enhance_pdf
+    return input_path, pages_to_process, rotation_info, enhance_input_file
 
 
 def rotate_pdf_pages(pdf_path, rotation_info):
@@ -161,6 +206,29 @@ def rotate_pdf_pages(pdf_path, rotation_info):
     except Exception as e:
         print(f"[ERROR] Failed to rotate PDF: {e}")
         return pdf_path
+
+
+def rotate_image_file(image_path, rotation_info):
+    """Rotate image input"""
+    if not rotation_info:
+        return image_path
+
+    print(f"\n[ROTATE] Rotating image by {rotation_info['angle']} degrees...")
+
+    try:
+        image = Image.open(image_path).convert("RGB")
+        rotated_image = image.rotate(-rotation_info['angle'], expand=True)
+
+        input_path = Path(image_path)
+        rotated_path = input_path.with_name(f"{input_path.stem}_rotated{input_path.suffix}")
+        rotated_image.save(rotated_path)
+
+        print(f"[ROTATE] Rotated image saved as: {rotated_path}")
+        return str(rotated_path)
+
+    except Exception as e:
+        print(f"[ERROR] Failed to rotate image: {e}")
+        return image_path
 
 
 def enhance_pdf_tables(pdf_path, dpi=300, line_strength=2, show_progress=True):
@@ -242,6 +310,187 @@ def enhance_pdf_tables(pdf_path, dpi=300, line_strength=2, show_progress=True):
         return pdf_path
 
 
+def enhance_image_tables(image_path, line_strength=2, show_progress=True):
+    """Enhance an image before table extraction"""
+    if show_progress:
+        print(f"\n[ENHANCE] Starting image enhancement...")
+
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Could not read image: {image_path}")
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            15, 10
+        )
+
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+
+        detect_horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+        detect_vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+
+        table_mask = cv2.add(detect_horizontal, detect_vertical)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (line_strength, line_strength))
+        table_mask = cv2.dilate(table_mask, kernel, iterations=2)
+        table_mask = cv2.morphologyEx(table_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        inverted_mask = cv2.bitwise_not(table_mask)
+        enhanced_gray = cv2.bitwise_and(gray, gray, mask=inverted_mask)
+        enhanced_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+
+        input_path = Path(image_path)
+        output_path = input_path.with_name(f"{input_path.stem}_enhanced{input_path.suffix}")
+        cv2.imwrite(str(output_path), enhanced_bgr)
+
+        if show_progress:
+            print(f"[ENHANCE] Enhanced image saved as: {output_path}")
+
+        return str(output_path)
+
+    except Exception as e:
+        print(f"[ERROR] Enhancement failed: {e}")
+        return image_path
+
+
+def _cluster_words_into_lines(words: list[dict], y_overlap_ratio: float = 0.5) -> list[list[dict]]:
+    """
+    Group words into visual reading lines using vertical overlap, then sort
+    each line left-to-right. Fixes wrong word order caused by large whitespace
+    (PDF content-stream order is not always left-to-right).
+    """
+    if not words:
+        return []
+
+    words = sorted(words, key=lambda w: (((w["y1"] + w["y2"]) / 2), w["x1"]))
+    lines: list[list[dict]] = []
+
+    for word in words:
+        y_center = (word["y1"] + word["y2"]) / 2
+        word_height = max(1, word["y2"] - word["y1"])
+        placed = False
+
+        for line in lines:
+            line_y_center = sum((w["y1"] + w["y2"]) / 2 for w in line) / len(line)
+            line_height = max(1, sum(w["y2"] - w["y1"] for w in line) / len(line))
+            threshold = y_overlap_ratio * min(word_height, line_height)
+            if abs(y_center - line_y_center) <= threshold:
+                line.append(word)
+                placed = True
+                break
+
+        if not placed:
+            lines.append([word])
+
+    lines.sort(key=lambda line: min(w["y1"] for w in line))
+    for line in lines:
+        line.sort(key=lambda w: w["x1"])
+    return lines
+
+
+def _words_to_reading_order_text(words: list[dict]) -> Optional[str]:
+    lines = _cluster_words_into_lines(words)
+    if not lines:
+        return None
+    text = "\n".join(" ".join(str(w["value"]).strip() for w in line if str(w.get("value", "")).strip())
+                     for line in lines).strip()
+    return text or None
+
+
+def _patch_img2table_cell_word_order() -> None:
+    """
+    Patch img2table OCR text assembly only.
+    Table detection / grid structure is unchanged.
+    """
+
+    def get_text_cell(self, cell: Cell, margin: int = 0, page_number: Optional[int] = None,
+                      min_confidence: int = 50) -> str:
+        bbox = cell.bbox(margin=margin)
+        df_words = self.df.filter(pl.col("class") == "ocrx_word")
+        if page_number:
+            df_words = df_words.filter(pl.col("page") == page_number)
+        df_words = df_words.filter(pl.col("value").is_not_null() & (pl.col("confidence") >= min_confidence))
+
+        df_words = (
+            df_words.with_columns([
+                pl.lit(bbox[0]).alias("x1_bbox"),
+                pl.lit(bbox[1]).alias("y1_bbox"),
+                pl.lit(bbox[2]).alias("x2_bbox"),
+                pl.lit(bbox[3]).alias("y2_bbox"),
+            ])
+            .with_columns([
+                pl.max_horizontal(["x1", "x1_bbox"]).alias("x_left"),
+                pl.max_horizontal(["y1", "y1_bbox"]).alias("y_top"),
+                pl.min_horizontal(["x2", "x2_bbox"]).alias("x_right"),
+                pl.min_horizontal(["y2", "y2_bbox"]).alias("y_bottom"),
+            ])
+        )
+
+        df_intersection = (
+            df_words.filter(pl.col("x_right") > pl.col("x_left"))
+            .filter(pl.col("y_bottom") > pl.col("y_top"))
+        )
+        df_areas = df_intersection.with_columns([
+            ((pl.col("x2") - pl.col("x1")) * (pl.col("y2") - pl.col("y1"))).alias("w_area"),
+            ((pl.col("x_right") - pl.col("x_left")) * (pl.col("y_bottom") - pl.col("y_top"))).alias("int_area"),
+        ])
+        df_words_contained = df_areas.filter(pl.col("int_area") / pl.col("w_area") > 0.5)
+
+        words = df_words_contained.select(["value", "x1", "y1", "x2", "y2"]).to_dicts()
+        return _words_to_reading_order_text(words)
+
+    def get_text_table(self, table: Table, page_number: Optional[int] = None, min_confidence: int = 50) -> Table:
+        df_words = self.df.filter(pl.col("class") == "ocrx_word")
+        if page_number:
+            df_words = df_words.filter(pl.col("page") == page_number)
+        df_words = df_words.filter(pl.col("value").is_not_null() & (pl.col("confidence") >= min_confidence))
+
+        list_cells = [
+            {"row": id_row, "col": id_col, "x1_w": cell.x1, "x2_w": cell.x2, "y1_w": cell.y1, "y2_w": cell.y2}
+            for id_row, row in enumerate(table.items)
+            for id_col, cell in enumerate(row.items)
+        ]
+        df_cells = pl.DataFrame(data=list_cells)
+        df_word_cells = df_words.join(other=df_cells, how="cross")
+
+        df_word_cells = df_word_cells.with_columns([
+            pl.max_horizontal(["x1", "x1_w"]).alias("x_left"),
+            pl.max_horizontal(["y1", "y1_w"]).alias("y_top"),
+            pl.min_horizontal(["x2", "x2_w"]).alias("x_right"),
+            pl.min_horizontal(["y2", "y2_w"]).alias("y_bottom"),
+        ])
+
+        df_intersection = (
+            df_word_cells.filter(pl.col("x_right") > pl.col("x_left"))
+            .filter(pl.col("y_bottom") > pl.col("y_top"))
+        )
+        df_areas = df_intersection.with_columns([
+            ((pl.col("x2") - pl.col("x1")) * (pl.col("y2") - pl.col("y1"))).alias("w_area"),
+            ((pl.col("x_right") - pl.col("x_left")) * (pl.col("y_bottom") - pl.col("y_top"))).alias("int_area"),
+        ])
+        df_words_contained = df_areas.filter(pl.col("int_area") / pl.col("w_area") > 0.5)
+
+        if df_words_contained.height == 0:
+            return table
+
+        for key, group in df_words_contained.group_by(["row", "col"]):
+            row_idx, col_idx = key
+            words = group.select(["value", "x1", "y1", "x2", "y2"]).to_dicts()
+            table.items[int(row_idx)].items[int(col_idx)].content = _words_to_reading_order_text(words)
+
+        return table
+
+    OCRDataframe.get_text_cell = get_text_cell
+    OCRDataframe.get_text_table = get_text_table
+
+
 def reduce_pdf_resolution(input_pdf_path, target_dpi=72):
     """Reduce PDF resolution"""
     print(f"\n[REDUCE] Reducing PDF resolution to {target_dpi} DPI...")
@@ -284,48 +533,55 @@ def reduce_pdf_resolution(input_pdf_path, target_dpi=72):
         return input_pdf_path
 
 
-def extract_tables_with_tesseract(pdf_path, pages=None):
+def extract_tables_with_tesseract(input_path, pages=None):
     """Extract tables using TesseractOCR"""
     print(f"\n[EXTRACT] Starting table extraction with TesseractOCR...")
 
     try:
+        # Fix cell word order only (left-to-right by bbox). Detection stays unchanged.
+        _patch_img2table_cell_word_order()
+
         # Initialize OCR (Tesseract)
         ocr = TesseractOCR(n_threads=1, lang="eng")
+        input_file = Path(input_path)
 
-        # Initialize PDF document with specific pages
-        pdf = PDF(src=pdf_path,
-                  pages=pages,
-                  detect_rotation=False,
-                  pdf_text_extraction=True)
-
-        # Extract tables from the selected pages
-        extracted_tables = pdf.extract_tables(
+        extract_kwargs = dict(
             ocr=ocr,
             implicit_rows=False,
             implicit_columns=False,
             borderless_tables=True,
-            min_confidence=10
+            min_confidence=10,
         )
 
+        if is_pdf_file(input_path):
+            document = PDF(src=input_path,
+                           pages=pages,
+                           detect_rotation=False,
+                           pdf_text_extraction=True)
+            page_label = lambda page_num: f"Page {page_num + 1}"
+        else:
+            document = Img2TableImage(src=input_path, detect_rotation=False)
+            page_label = lambda page_num: "Image"
+
+        extracted_tables = document.extract_tables(**extract_kwargs)
+
         if extracted_tables:
-            # Create a single Excel file with all tables
-            excel_filename = "extracted_tables.xlsx"
-            pdf.to_xlsx(dest=excel_filename, ocr=ocr)
+            excel_filename = f"{input_file.stem}_extracted_tables.xlsx"
+            document.to_xlsx(dest=excel_filename, **extract_kwargs)
             print(f"[EXTRACT] Tables saved to: {excel_filename}")
 
-            # Count and display summary
             total_tables = sum(len(tables) for tables in extracted_tables.values())
             print(f"[EXTRACT] Total tables extracted: {total_tables}")
 
             for page_num, tables in extracted_tables.items():
                 if tables:
-                    print(f"  - Page {page_num + 1}: {len(tables)} table(s)")
+                    print(f"  - {page_label(page_num)}: {len(tables)} table(s)")
                     for table_idx, table in enumerate(tables):
                         print(f"    Table {table_idx + 1}: {table.df.shape[0]} rows × {table.df.shape[1]} columns")
 
             return excel_filename, total_tables
         else:
-            print("[EXTRACT] No tables found in the PDF")
+            print("[EXTRACT] No tables found in the input file")
             return None, 0
 
     except Exception as e:
@@ -337,51 +593,59 @@ def main():
     """Main automation function"""
     try:
         # Get all user inputs
-        pdf_path, pages_to_process, rotation_info, enhance_pdf = get_user_input()
+        input_path, pages_to_process, rotation_info, enhance_input = get_user_input()
 
         print(f"\n=== Processing Summary ===")
-        print(f"PDF: {pdf_path}")
-        print(f"Pages to process: {'All' if pages_to_process is None else [p+1 for p in pages_to_process]}")
+        print(f"Input: {input_path}")
+        if is_pdf_file(input_path):
+            print(f"Pages to process: {'All' if pages_to_process is None else [p+1 for p in pages_to_process]}")
+        else:
+            print("Pages to process: N/A for image input")
         print(f"Rotation: {'Yes' if rotation_info else 'No'}")
-        print(f"Enhancement: {'Yes' if enhance_pdf else 'No'}")
+        print(f"Enhancement: {'Yes' if enhance_input else 'No'}")
 
-        current_pdf = pdf_path
+        current_input = input_path
         intermediate_files = []
 
-        # Step 1: Rotate PDF if requested
         if rotation_info:
-            current_pdf = rotate_pdf_pages(current_pdf, rotation_info)
-            if current_pdf != pdf_path:
-                intermediate_files.append(current_pdf)
-
-        # Step 2: Enhance PDF if requested
-        if enhance_pdf:
-            current_pdf = enhance_pdf_tables(current_pdf)
-            if not current_pdf.endswith('_enhanced.pdf'):
-                print("[WARN] Enhancement may have failed, proceeding with current PDF")
+            if is_pdf_file(current_input):
+                current_input = rotate_pdf_pages(current_input, rotation_info)
             else:
-                intermediate_files.append(current_pdf)
+                current_input = rotate_image_file(current_input, rotation_info)
 
-            # Step 3: Reduce resolution (only if enhanced)
-            reduced_pdf = reduce_pdf_resolution(current_pdf)
-            if reduced_pdf != current_pdf:
-                current_pdf = reduced_pdf
-                intermediate_files.append(current_pdf)
+            if current_input != input_path:
+                intermediate_files.append(current_input)
 
-        # Step 4: Extract tables using TesseractOCR
-        excel_file, table_count = extract_tables_with_tesseract(current_pdf, pages_to_process)
+        if enhance_input:
+            if is_pdf_file(current_input):
+                current_input = enhance_pdf_tables(current_input)
+                if not current_input.endswith('_enhanced.pdf'):
+                    print("[WARN] Enhancement may have failed, proceeding with current input")
+                else:
+                    intermediate_files.append(current_input)
+
+                reduced_pdf = reduce_pdf_resolution(current_input)
+                if reduced_pdf != current_input:
+                    current_input = reduced_pdf
+                    intermediate_files.append(current_input)
+            else:
+                current_input = enhance_image_tables(current_input)
+                if "_enhanced" not in Path(current_input).stem:
+                    print("[WARN] Enhancement may have failed, proceeding with current input")
+                else:
+                    intermediate_files.append(current_input)
+
+        excel_file, table_count = extract_tables_with_tesseract(current_input, pages_to_process)
 
         if excel_file and table_count > 0:
             print(f"\n=== SUCCESS ===")
             print(f"Extracted {table_count} tables to: {excel_file}")
 
-            # Ask user about keeping the final processed PDF
-            keep_final_pdf = input(f"\nKeep the final processed PDF ({current_pdf})? (y/n): ").strip().lower() == 'y'
+            keep_final_output = input(f"\nKeep the final processed file ({current_input})? (y/n): ").strip().lower() == 'y'
 
-            # Cleanup intermediate files
             print(f"\n[CLEANUP] Cleaning up intermediate files...")
             for file_path in intermediate_files:
-                if file_path != current_pdf or not keep_final_pdf:
+                if file_path != current_input or not keep_final_output:
                     try:
                         os.remove(file_path)
                         print(f"[CLEANUP] Removed {file_path}")
@@ -391,15 +655,15 @@ def main():
             # Clean up temporary files
             cleanup_temp_files()
 
-            if keep_final_pdf and current_pdf != pdf_path:
-                print(f"[INFO] Final processed PDF kept as: {current_pdf}")
+            if keep_final_output and current_input != input_path:
+                print(f"[INFO] Final processed file kept as: {current_input}")
 
             print(f"\n=== FINAL OUTPUT ===")
             print(f"Excel file with extracted tables: {excel_file}")
 
         else:
             print(f"\n=== FAILED ===")
-            print("No tables were extracted. Please check your PDF and try again.")
+            print("No tables were extracted. Please check your input file and try again.")
 
             # Still cleanup intermediate files
             for file_path in intermediate_files:

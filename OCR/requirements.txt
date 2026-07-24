@@ -1,0 +1,9 @@
+transformers==4.57.1
+huggingface-hub>=0.34.0,<1.0
+torch
+torchvision
+timm
+pymupdf
+pillow
+openpyxl
+pytesseract
