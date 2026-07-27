@@ -19,7 +19,7 @@ from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 # CONFIGURATION
 # =============================================================================
 
-INPUT_PDF = Path("Current-Test/MBP_1_CRA.pdf")
+INPUT_PDF = Path("Current-Test/MBP_1_SCA.pdf")
 # INPUT_PDF = Path("MBP 1 GG 2026_enhanced_reduced.pdf")
 OUTPUT_XLSX = Path("extracted_tables.xlsx")
 DEBUG_DIR = Path(__file__).resolve().parent / "table_debug"

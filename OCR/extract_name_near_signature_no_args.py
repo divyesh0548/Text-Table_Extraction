@@ -5,12 +5,9 @@ Detect signatures in a PDF and extract the probable printed name nearby.
 Pipeline:
 1. Render each PDF page as an image.
 2. Detect signature bounding boxes with a custom Ultralytics YOLO model.
-3. Run Tesseract OCR once on the complete page.
-4. Find OCR text lines close to each signature.
-5. Remove repeated role phrases:
-       director
-       authorised signatory
-       authorized signatory
+3. Run Tesseract OCR on the page, and also OCR a band under each signature.
+4. Prefer text printed below the signature as the person's name.
+5. Strip role phrases (director, president, authorised signatory, etc.).
 6. Rank the remaining nearby lines and return the most probable name.
 7. Save JSON, CSV, annotated page images, and an annotated PDF.
 
@@ -52,8 +49,27 @@ from ultralytics import YOLO
 
 DEFAULT_EXCLUDED_PHRASES = (
     "director",
+    "managing director",
+    "whole time director",
+    "whole-time director",
+    "executive director",
+    "independent director",
+    "additional director",
+    "nominee director",
+    "president",
+    "vice president",
+    "vice-president",
+    "chairman",
+    "chairperson",
+    "secretary",
+    "company secretary",
     "authorised signatory",
     "authorized signatory",
+    "authorised signatories",
+    "authorized signatories",
+    "signatory",
+    "partner",
+    "proprietor",
 )
 
 
@@ -62,20 +78,20 @@ DEFAULT_EXCLUDED_PHRASES = (
 # =============================================================================
 
 # Input PDF that contains signatures.
-INPUT_PDF = Path(r"C:\Users\YourName\Documents\input.pdf")
+INPUT_PDF = Path("Current-test/MBP 1 AKB 2026.pdf")
 
 # Trained Ultralytics YOLO model that detects signatures.
-SIGNATURE_MODEL = Path(r"C:\Users\YourName\Documents\best.pt")
+SIGNATURE_MODEL = Path("Sign-Detection-YOLO8s.pt")
 
 # Folder in which JSON, CSV, annotated images, and annotated PDF will be saved.
-OUTPUT_DIR = Path(r"C:\Users\YourName\Documents\signature_results")
+OUTPUT_DIR = Path("signature_results")
 
 # Windows example:
 # TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 #
 # Use None on Linux or when tesseract is already available in PATH.
 TESSERACT_CMD: str | None = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    r"C:\Users\Divyesh Parmar\Downloads\Tesserect OCR\tesseract.exe"
 )
 
 # PDF rendering resolution.
@@ -94,20 +110,44 @@ OCR_LANGUAGE = "eng"
 OCR_PSM = 6
 MINIMUM_OCR_CONFIDENCE = 25.0
 
-# Repeated text to remove from nearby OCR results.
+# Role / designation words to strip so only the person's name remains.
 EXCLUDED_PHRASES = (
     "director",
+    "managing director",
+    "whole time director",
+    "whole-time director",
+    "executive director",
+    "independent director",
+    "additional director",
+    "nominee director",
+    "president",
+    "vice president",
+    "vice-president",
+    "chairman",
+    "chairperson",
+    "secretary",
+    "company secretary",
     "authorised signatory",
     "authorized signatory",
+    "authorised signatories",
+    "authorized signatories",
+    "signatory",
+    "partner",
+    "proprietor",
 )
 
-# Search distances around the signature, measured in rendered image pixels.
-SEARCH_DOWN = 260
-SEARCH_UP = 140
-SEARCH_SIDE = 320
+# Search band BELOW the signature (name is usually printed under the ink).
+# Distances are in rendered image pixels at DPI above.
+SEARCH_DOWN = 420
+SEARCH_UP = 40
+SEARCH_SIDE = 80
+# Extra padding around the below-signature crop used for a second OCR pass.
+BELOW_OCR_PAD_X = 40
+BELOW_OCR_PAD_TOP = 8
+BELOW_OCR_HEIGHT = 220
 
 # Candidate must reach this score to be selected as the probable name.
-MINIMUM_NAME_SCORE = 0.48
+MINIMUM_NAME_SCORE = 0.35
 
 # =============================================================================
 # END OF CONFIGURATION
@@ -167,7 +207,7 @@ def normalize_for_matching(text: str) -> str:
 def remove_excluded_phrases(
     text: str,
     excluded_phrases: Iterable[str],
-) -> str:
+    ) -> str:
     """
     Remove role phrases without discarding a name on the same OCR line.
 
@@ -271,8 +311,16 @@ def name_likeness(text: str) -> float:
         "firm",
         "partner",
         "chairman",
+        "chairperson",
         "secretary",
         "member",
+        "director",
+        "president",
+        "managing",
+        "executive",
+        "independent",
+        "authorised",
+        "authorized",
         "date",
         "place",
         "name",
@@ -301,7 +349,7 @@ def line_box(line: TextLine) -> dict[str, int]:
 def intersection_area(
     box_a: tuple[int, int, int, int],
     box_b: tuple[int, int, int, int],
-) -> int:
+     ) -> int:
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
 
@@ -313,7 +361,7 @@ def intersection_area(
 def horizontal_overlap_ratio(
     line: TextLine,
     signature_box: tuple[int, int, int, int],
-) -> float:
+     ) -> float:
     sx1, _, sx2, _ = signature_box
     overlap = max(0, min(line.x2, sx2) - max(line.x1, sx1))
     return overlap / max(1, min(line.width, sx2 - sx1))
@@ -322,7 +370,7 @@ def horizontal_overlap_ratio(
 def vertical_overlap_ratio(
     line: TextLine,
     signature_box: tuple[int, int, int, int],
-) -> float:
+     ) -> float:
     _, sy1, _, sy2 = signature_box
     overlap = max(0, min(line.y2, sy2) - max(line.y1, sy1))
     return overlap / max(1, min(line.height, sy2 - sy1))
@@ -334,35 +382,39 @@ def classify_relative_region(
     search_down: int,
     search_up: int,
     search_side: int,
-) -> tuple[str, float] | None:
+    ) -> tuple[str, float] | None:
     """
     Return the candidate region and spatial closeness score.
 
-    Priority generally becomes:
-        below -> right -> left -> above
+    Printed names are almost always under the signature, so "below" is
+    preferred strongly over left / right / above.
     """
     sx1, sy1, sx2, sy2 = signature_box
     signature_center_x = (sx1 + sx2) / 2
     signature_center_y = (sy1 + sy2) / 2
+    signature_width = max(1, sx2 - sx1)
 
     h_overlap = horizontal_overlap_ratio(line, signature_box)
     v_overlap = vertical_overlap_ratio(line, signature_box)
 
     candidates: list[tuple[str, float]] = []
 
-    # Text below the signature, allowing some left/right expansion.
+    # Text below the signature (primary region for the person's name).
     below_gap = line.y1 - sy2
-    if (
-        -10 <= below_gap <= search_down
-        and line.center_x >= sx1 - search_side
-        and line.center_x <= sx2 + search_side
-    ):
+    horizontally_near = (
+        line.center_x >= sx1 - search_side - signature_width * 0.25
+        and line.center_x <= sx2 + search_side + signature_width * 0.25
+    )
+    if -25 <= below_gap <= search_down and horizontally_near:
         alignment = max(
             0.0,
-            1.0 - abs(line.center_x - signature_center_x) / max(search_side, 1),
+            1.0 - abs(line.center_x - signature_center_x)
+            / max(search_side + signature_width * 0.5, 1),
         )
         distance = max(0.0, 1.0 - max(0, below_gap) / max(search_down, 1))
-        candidates.append(("below", 0.60 * distance + 0.40 * max(h_overlap, alignment)))
+        candidates.append(
+            ("below", 0.55 * distance + 0.45 * max(h_overlap, alignment))
+        )
 
     # Text to the right.
     right_gap = line.x1 - sx2
@@ -412,10 +464,10 @@ def classify_relative_region(
         return None
 
     region_priority = {
-        "below": 0.10,
-        "right": 0.06,
+        "below": 0.22,
+        "right": 0.04,
         "left": 0.03,
-        "above": 0.00,
+        "above": 0.01,
     }
 
     region, spatial_score = max(
@@ -430,7 +482,7 @@ def extract_ocr_lines(
     language: str,
     minimum_ocr_confidence: float,
     psm: int,
-) -> list[TextLine]:
+    ) -> list[TextLine]:
     """
     Run Tesseract on the whole page and group OCR words into text lines.
     """
@@ -502,6 +554,93 @@ def extract_ocr_lines(
     return lines
 
 
+def line_mostly_inside_signature(
+    line: TextLine,
+    signature_box: tuple[int, int, int, int],
+    overlap_threshold: float = 0.55,
+    ) -> bool:
+    """True when most of the OCR line sits inside the signature ink box."""
+    line_area = max(1, line.width * line.height)
+    overlap = intersection_area(
+        signature_box,
+        (line.x1, line.y1, line.x2, line.y2),
+    )
+    return (overlap / line_area) >= overlap_threshold
+
+
+def ocr_band_below_signature(
+    image_bgr: np.ndarray,
+    signature_box: tuple[int, int, int, int],
+    language: str,
+    excluded_phrases: tuple[str, ...],
+    pad_x: int = BELOW_OCR_PAD_X,
+    pad_top: int = BELOW_OCR_PAD_TOP,
+    band_height: int = BELOW_OCR_HEIGHT,
+    ) -> list[dict]:
+    """
+    OCR a crop immediately under the signature box.
+
+    This recovers names when page-level OCR lines miss the printed text below
+    a tight signature detection.
+    """
+    sx1, _, sx2, sy2 = signature_box
+    height, width = image_bgr.shape[:2]
+
+    x1 = max(0, sx1 - pad_x)
+    y1 = max(0, sy2 - pad_top)
+    x2 = min(width, sx2 + pad_x)
+    y2 = min(height, sy2 + band_height)
+
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return []
+
+    crop = image_bgr[y1:y2, x1:x2]
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    # Upscale sparse label text under signatures.
+    rgb = cv2.resize(
+        rgb,
+        (rgb.shape[1] * 2, rgb.shape[0] * 2),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    candidates: list[dict] = []
+    for psm in (6, 7, 4):
+        text = pytesseract.image_to_string(
+            rgb,
+            lang=language,
+            config=f"--oem 3 --psm {psm}",
+        )
+        for raw_line in text.splitlines():
+            original = normalize_spaces(raw_line)
+            if not original:
+                continue
+            cleaned = remove_excluded_phrases(original, excluded_phrases)
+            if not cleaned:
+                continue
+            likeness = name_likeness(cleaned)
+            if likeness < 0.20:
+                continue
+
+            # Prefer the first good name-like line in this below band.
+            combined = 0.55 * 0.95 + 0.40 * likeness + 0.05
+            candidates.append(
+                {
+                    "original_text": original,
+                    "cleaned_text": cleaned,
+                    "region": "below",
+                    "ocr_confidence": 70.0,
+                    "spatial_score": 0.95,
+                    "name_likeness": round(likeness, 4),
+                    "combined_score": round(combined, 4),
+                    "box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                    "source": "below_crop",
+                }
+            )
+
+    candidates.sort(key=lambda item: item["combined_score"], reverse=True)
+    return candidates
+
+
 def choose_name_near_signature(
     signature_box: tuple[int, int, int, int],
     ocr_lines: list[TextLine],
@@ -510,15 +649,15 @@ def choose_name_near_signature(
     search_up: int,
     search_side: int,
     minimum_name_score: float,
+    image_bgr: np.ndarray | None = None,
+    language: str = "eng",
     maximum_candidates: int = 10,
-) -> tuple[dict | None, list[dict]]:
+    ) -> tuple[dict | None, list[dict]]:
     ranked_candidates: list[dict] = []
 
     for line in ocr_lines:
-        current_box = (line.x1, line.y1, line.x2, line.y2)
-
-        # Ignore OCR produced from inside the signature marks.
-        if intersection_area(signature_box, current_box) > 0:
+        # Ignore OCR that is mostly the signature ink itself.
+        if line_mostly_inside_signature(line, signature_box):
             continue
 
         relative = classify_relative_region(
@@ -533,24 +672,20 @@ def choose_name_near_signature(
             continue
 
         region, spatial_score = relative
-
-        cleaned_text = remove_excluded_phrases(
-            line.text,
-            excluded_phrases,
-        )
-
+        cleaned_text = remove_excluded_phrases(line.text, excluded_phrases)
         if not cleaned_text:
             continue
 
         likeness = name_likeness(cleaned_text)
         ocr_score = max(0.0, min(1.0, line.confidence / 100.0))
 
-        # Spatial position matters most; OCR confidence and name appearance
-        # provide supporting evidence.
+        # Strongly prefer text found under the signature.
+        region_bonus = 0.12 if region == "below" else 0.0
         combined_score = (
             0.48 * spatial_score
             + 0.37 * likeness
             + 0.15 * ocr_score
+            + region_bonus
         )
 
         ranked_candidates.append(
@@ -561,13 +696,28 @@ def choose_name_near_signature(
                 "ocr_confidence": round(line.confidence, 2),
                 "spatial_score": round(spatial_score, 4),
                 "name_likeness": round(likeness, 4),
-                "combined_score": round(combined_score, 4),
+                "combined_score": round(min(1.0, combined_score), 4),
                 "box": line_box(line),
+                "source": "page_ocr",
             }
         )
 
+    # Dedicated OCR of the band under the signature box.
+    if image_bgr is not None:
+        ranked_candidates.extend(
+            ocr_band_below_signature(
+                image_bgr=image_bgr,
+                signature_box=signature_box,
+                language=language,
+                excluded_phrases=excluded_phrases,
+            )
+        )
+
     ranked_candidates.sort(
-        key=lambda candidate: candidate["combined_score"],
+        key=lambda candidate: (
+            1 if candidate.get("region") == "below" else 0,
+            candidate["combined_score"],
+        ),
         reverse=True,
     )
     ranked_candidates = ranked_candidates[:maximum_candidates]
@@ -600,7 +750,7 @@ def detect_signature_boxes(
     confidence_threshold: float,
     image_size: int,
     signature_class_id: int | None,
-) -> list[tuple[tuple[int, int, int, int], float, int]]:
+    ) -> list[tuple[tuple[int, int, int, int], float, int]]:
     results = model.predict(
         source=image_bgr,
         conf=confidence_threshold,
@@ -654,7 +804,7 @@ def annotate_result(
     signature_number: int,
     signature_confidence: float,
     best_candidate: dict | None,
-) -> None:
+       ) -> None:
     sx1, sy1, sx2, sy2 = signature_box
 
     cv2.rectangle(
@@ -881,6 +1031,8 @@ def process_pdf(
                     search_up=search_up,
                     search_side=search_side,
                     minimum_name_score=minimum_name_score,
+                    image_bgr=page_image,
+                    language=language,
                 )
 
                 sx1, sy1, sx2, sy2 = signature_box
