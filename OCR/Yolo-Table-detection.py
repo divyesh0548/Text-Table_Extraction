@@ -19,7 +19,7 @@ pd.set_option("display.max_columns", 500)
 pd.set_option("display.width", 1000)
 
 # INPUT_SOURCE = Path("./page_1.png")
-INPUT_SOURCE = Path("Current-Test/MBP_1_RKB.pdf")
+INPUT_SOURCE = Path("Aarti - Mandays Apr 26.pdf")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 PDF_RENDER_DPI = 300
 

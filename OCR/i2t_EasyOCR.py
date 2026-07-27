@@ -231,9 +231,9 @@ def extract_and_save_tables_with_dataframes(input_path, pages=None):
 
 def main():
     # pdf_path = input("Enter the path to your PDF file: ").strip()
-    pdf_path = "Current-Test/MBP 1 AKB 2026.pdf"
+    # pdf_path = "Current-Test/MBP 1 AKB 2026.pdf"
     # pdf_path = "page_1_table_crop.png"
-    # pdf_path = "CH-022026-1122-INVOICE_image_input.pdf"
+    pdf_path = "Aarti - Mandays Apr 26.pdf"
 
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"Input file not found: {Path(pdf_path).resolve()}")

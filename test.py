@@ -29,10 +29,10 @@ def remove_duplicate_headers_largest_content(df):
         return df_cleaned.reset_index(drop=True)
 
 table_reports = []
-pdf_file = "AnnexureASP.pdf"
+pdf_file = "GRP SL 02 PAYSHEET APRIL- 2026.pdf"
     
-tables = camelot.read_pdf(pdf_file, pages="all", flavor="stream") 
-# tables = camelot.read_pdf(pdf_file, pages="all", flavor="lattice") 
+# tables = camelot.read_pdf(pdf_file, pages="all", flavor="stream") 
+tables = camelot.read_pdf(pdf_file, pages="all", flavor="lattice") 
 # tables = camelot.read_pdf(pdf_file, pages="all", process_background=True) 
 print(f"{len(tables)} tables found")
 table_num = len(tables)

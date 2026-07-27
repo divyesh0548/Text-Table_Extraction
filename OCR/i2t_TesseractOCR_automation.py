@@ -117,8 +117,8 @@ def get_user_input():
 
     # Get input path
     # input_path = input("Enter the path to your PDF or image file: ").strip()
-    # input_path = "CH-012026-0062-INVOICE.pdf"
-    input_path = "Current-Test/MBP 1 GG 2026.pdf"
+    input_path = "Aarti - Mandays Apr 26.pdf"
+    # input_path = "Current-Test/MBP 1 GG 2026.pdf"
 
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {Path(input_path).resolve()}")

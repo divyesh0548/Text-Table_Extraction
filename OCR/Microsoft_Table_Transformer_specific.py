@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Callable
 
 import fitz  # PyMuPDF
@@ -11,7 +12,7 @@ import torch
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 
 
@@ -19,8 +20,8 @@ from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 # CONFIGURATION
 # =============================================================================
 
-INPUT_PDF = Path("Current-Test/MBP_1_SCA.pdf")
-# INPUT_PDF = Path("MBP 1 GG 2026_enhanced_reduced.pdf")
+# INPUT_PDF = Path("Current-Test/MBP 1 RKB 2026.pdf")
+INPUT_PDF = Path(r"Aarti-Mandays May 26.pdf")
 OUTPUT_XLSX = Path("extracted_tables.xlsx")
 DEBUG_DIR = Path(__file__).resolve().parent / "table_debug"
 
@@ -121,6 +122,80 @@ def remove_duplicate_detections(
             and box_iou(item.box, old.box) >= iou_threshold
             for old in kept
         )
+        if not duplicate:
+            kept.append(item)
+
+    return kept
+
+
+def axis_length(
+    detection: Detection,
+    axis: str,
+) -> float:
+    if axis == "row":
+        return max(0.0, detection.box[3] - detection.box[1])
+    return max(0.0, detection.box[2] - detection.box[0])
+
+
+def axis_center(
+    detection: Detection,
+    axis: str,
+) -> float:
+    if axis == "row":
+        return (detection.box[1] + detection.box[3]) / 2
+    return (detection.box[0] + detection.box[2]) / 2
+
+
+def orthogonal_overlap_ratio(
+    first: Detection,
+    second: Detection,
+    axis: str,
+) -> float:
+    if axis == "row":
+        start = max(first.box[0], second.box[0])
+        end = min(first.box[2], second.box[2])
+        base = min(first.box[2] - first.box[0], second.box[2] - second.box[0])
+    else:
+        start = max(first.box[1], second.box[1])
+        end = min(first.box[3], second.box[3])
+        base = min(first.box[3] - first.box[1], second.box[3] - second.box[1])
+
+    if base <= 0:
+        return 0.0
+    return max(0.0, end - start) / base
+
+
+def collapse_nearby_structure_detections(
+    detections: list[Detection],
+    axis: str,
+    center_tolerance_ratio: float = 0.4,
+    overlap_ratio_threshold: float = 0.9,
+) -> list[Detection]:
+    """
+    Remove nearly identical row/column detections that survive IoU-based filtering.
+    """
+    kept: list[Detection] = []
+
+    for item in sorted(detections, key=lambda detection: detection.score, reverse=True):
+        item_length = axis_length(item, axis)
+        duplicate = False
+
+        for existing in kept:
+            existing_length = axis_length(existing, axis)
+            tolerance = max(
+                3.0,
+                min(item_length, existing_length) * center_tolerance_ratio,
+            )
+            centers_are_close = (
+                abs(axis_center(item, axis) - axis_center(existing, axis))
+                <= tolerance
+            )
+            overlap_ratio = orthogonal_overlap_ratio(item, existing, axis)
+
+            if centers_are_close and overlap_ratio >= overlap_ratio_threshold:
+                duplicate = True
+                break
+
         if not duplicate:
             kept.append(item)
 
@@ -321,6 +396,131 @@ class TableTransformerEngine:
 # OCR ADAPTER
 # =============================================================================
 
+def cell_has_visible_ink(
+    cell_image: Image.Image,
+    dark_threshold: int = 170,
+    minimum_ink_ratio: float = 0.005,
+    minimum_dark_pixels: int = 8,
+) -> bool:
+    """
+    Return True when a cell crop contains enough dark pixels to justify OCR.
+
+    Ignores a thin border so table grid lines alone do not count as content.
+    Thresholds are intentionally soft so faint/small text is still OCR'd.
+    """
+    gray = cell_image.convert("L")
+    width, height = gray.size
+    if width < 2 or height < 2:
+        return False
+
+    inset_x = max(1, min(3, width // 10))
+    inset_y = max(1, min(3, height // 10))
+    if width > 2 * inset_x and height > 2 * inset_y:
+        gray = gray.crop(
+            (inset_x, inset_y, width - inset_x, height - inset_y)
+        )
+
+    histogram = gray.histogram()
+    total_pixels = sum(histogram) or 1
+    dark_pixels = sum(histogram[:dark_threshold])
+    if dark_pixels < minimum_dark_pixels:
+        return False
+    return (dark_pixels / total_pixels) >= minimum_ink_ratio
+
+
+def ocr_with_confidence(
+    image: Image.Image,
+    config: str,
+    ) -> tuple[str, float]:
+    """Run Tesseract and return recognized text plus mean word confidence."""
+    data = pytesseract.image_to_data(
+        image,
+        config=config,
+        output_type=pytesseract.Output.DICT,
+    )
+
+    texts: list[str] = []
+    confidences: list[float] = []
+
+    for text, confidence in zip(data.get("text", []), data.get("conf", [])):
+        cleaned = str(text or "").strip()
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            continue
+
+        if not cleaned or confidence_value < 0:
+            continue
+
+        texts.append(cleaned)
+        confidences.append(confidence_value)
+
+    if not confidences:
+        return "", 0.0
+
+    return " ".join(texts), sum(confidences) / len(confidences)
+
+
+def is_gibberish_token(token: str) -> bool:
+    """Heuristic check for OCR hallucinated alphabetic tokens."""
+    word = token.lower()
+    if not word.isalpha():
+        return False
+
+    protected = {
+        "and", "the", "for", "not", "yes", "nil", "ltd", "pvt", "huf",
+        "mr", "mrs", "ms", "dr", "no", "sr", "qty", "nos", "amt", "ref",
+        "date", "name", "code", "type", "unit", "rate", "total", "page",
+        "from", "with", "this", "that", "each", "paid", "free", "none",
+        "cash", "bank", "bill", "item", "amount", "number", "invoice",
+        "address", "details", "description", "particulars", "quantity",
+        "value", "price", "weight", "remarks", "month", "year", "days",
+    }
+    if word in protected:
+        return False
+
+    # Keep common uppercase-looking codes/acronyms (INR, HSN, GST...).
+    if token.isupper() and 2 <= len(token) <= 5:
+        return False
+
+    # Keep normal short Title Case tokens (names/labels); only reject tiny crumbs.
+    if len(word) <= 2:
+        return True
+
+    vowels = sum(character in "aeiou" for character in word)
+    if len(word) >= 4 and vowels == 0:
+        return True
+
+    # Very low vowel density is typical of OCR junk.
+    if len(word) >= 5 and vowels / len(word) < 0.2:
+        return True
+
+    # Repeated/near-repeated characters: "taee", "aaaa", "llll".
+    if len(word) >= 4 and len(set(word)) <= 2:
+        return True
+
+    # Rare-letter heavy fragments are usually noise.
+    rare = sum(character in "qzxjvwk" for character in word)
+    if len(word) >= 4 and rare / len(word) >= 0.4:
+        return True
+
+    # Short random-looking words with awkward consonant clusters.
+    if len(word) <= 6 and re.search(r"[bcdfghjklmnpqrstvwxyz]{4,}", word):
+        return True
+
+    # Weird mixed casing (e.g. "iRae", "aFeE") is typical OCR junk.
+    if (
+        len(token) >= 4
+        and not token.islower()
+        and not token.isupper()
+        and not token.istitle()
+        and len(token) <= 8
+    ):
+        return True
+
+    return False
+
+
 def default_ocr(cell_image: Image.Image) -> str:
     """
     Standalone OCR implementation using Tesseract.
@@ -333,24 +533,74 @@ def default_ocr(cell_image: Image.Image) -> str:
     if cell_image.width < 2 or cell_image.height < 2:
         return ""
 
+    # Blank / near-blank cells: Tesseract invents random strings from noise.
+    if not cell_has_visible_ink(cell_image):
+        return ""
+
     enlarged = cell_image.resize(
         (cell_image.width * 2, cell_image.height * 2),
         Image.Resampling.LANCZOS,
-    )
+    ).convert("L")
+    contrasted = ImageOps.autocontrast(enlarged)
+    thresholded = contrasted.point(
+        lambda pixel: 255 if pixel > 180 else 0,
+        mode="1",
+    ).convert("L")
 
-    text = pytesseract.image_to_string(
-        enlarged,
-        config="--oem 3 --psm 6",
-    )
+    def normalize_text(text: str) -> str:
+        normalized_lines = [
+            " ".join(line.split())
+            for line in text.splitlines()
+            if line.strip()
+        ]
+        return "\n".join(normalized_lines).strip()
 
-    # Preserve lines, but normalize unnecessary spaces.
-    normalized_lines = [
-        " ".join(line.split())
-        for line in text.splitlines()
-        if line.strip()
-    ]
+    def score_text(text: str) -> tuple[int, int, int]:
+        cleaned = cleanup_extracted_cell_text(text)
+        if not cleaned:
+            return (-1, -1, -1)
 
-    return "\n".join(normalized_lines).strip()
+        # Prefer meaningful content, but still accept valid short cleaned values.
+        meaningful_bonus = 10 if has_meaningful_cell_content(cleaned) else 1
+        alnum_count = sum(character.isalnum() for character in cleaned)
+        length_score = len(cleaned.replace(" ", ""))
+        return (meaningful_bonus, alnum_count, length_score)
+
+    best_text = ""
+    best_score = (-1, -1, -1)
+
+    for image_variant in (contrasted, thresholded):
+        # Avoid PSM 11 (sparse text): it hallucinates on blank cells.
+        for psm in (6, 7):
+            config = f"--oem 3 --psm {psm}"
+            text, mean_confidence = ocr_with_confidence(
+                image_variant,
+                config=config,
+            )
+            # Soft threshold so faint but real digits/text are kept.
+            if text and mean_confidence < 35.0:
+                continue
+
+            normalized = normalize_text(text)
+            score = score_text(normalized)
+            if score > best_score:
+                best_score = score
+                best_text = normalized
+
+            # Fallback when confidence path is empty/too strict.
+            if score <= (-1, -1, -1):
+                fallback = normalize_text(
+                    pytesseract.image_to_string(
+                        image_variant,
+                        config=config,
+                    )
+                )
+                fallback_score = score_text(fallback)
+                if fallback_score > best_score:
+                    best_score = fallback_score
+                    best_text = fallback
+
+    return best_text
 
 
 def is_probable_ocr_noise(line: str) -> bool:
@@ -363,20 +613,42 @@ def is_probable_ocr_noise(line: str) -> bool:
     if all(token.isdigit() for token in tokens):
         return False
 
+    # Keep numeric-looking values that include separators/units crumbs.
+    if re.fullmatch(r"[\d\s,./:%()\-A-Za-z]+", line) and re.search(r"\d", line):
+        alpha_tokens = [token for token in tokens if not token.isdigit()]
+        if not alpha_tokens or all(len(token) <= 3 for token in alpha_tokens):
+            return False
+
     # Keep common short, valid forms such as "Mr. A. B.".
     if tokens[0] in {"mr", "mrs", "ms", "dr"}:
         return False
+
+    original_tokens = re.findall(r"[A-Za-z0-9]+", line)
+    alpha_original = [token for token in original_tokens if token.isalpha()]
+    if (
+        alpha_original
+        and all(is_gibberish_token(token) for token in alpha_original)
+        and not any(token.isdigit() for token in tokens)
+    ):
+        return True
 
     # Single short alphabetic token from a phantom/narrow column (e.g. ira, ode).
     if len(tokens) == 1:
         token = tokens[0]
         if token.isdigit():
             return False
-        return len(token) <= 3
+        if len(token) <= 2:
+            return True
+        return is_gibberish_token(original_tokens[0] if original_tokens else token)
 
     if len(tokens) < 3:
         # Two short leftovers such as "fe i" / "ae fe".
-        return all(len(token) <= 3 for token in tokens)
+        if all(len(token) <= 2 for token in tokens):
+            return True
+        return all(
+            (not token.isdigit()) and is_gibberish_token(original)
+            for token, original in zip(tokens, original_tokens)
+        )
 
     lengths = [len(token) for token in tokens]
     if max(lengths) <= 2:
@@ -384,6 +656,11 @@ def is_probable_ocr_noise(line: str) -> bool:
 
     # Examples: "i. tae ee" and similar short, disconnected fragments.
     protected_words = {"and", "the", "for", "not", "yes", "nil"}
+    if alpha_original and sum(
+        is_gibberish_token(token) for token in alpha_original
+    ) >= max(1, len(alpha_original) - 1):
+        return True
+
     return (
         max(lengths) <= 3
         and sum(length <= 2 for length in lengths) >= 2
@@ -402,18 +679,31 @@ def cleanup_extracted_cell_text(value: str | None) -> str:
         normalized = " ".join(line.split())
         if normalized and not is_probable_ocr_noise(normalized):
             kept_lines.append(normalized)
+
     return "\n".join(kept_lines).strip()
 
 
 def has_meaningful_cell_content(value: str | None) -> bool:
     """Return whether a cleaned cell contains real table content."""
-    text = cleanup_extracted_cell_text(value)
+    # Use lightweight cleanup here to avoid recursion with cleanup_extracted_cell_text.
+    text = str(value or "")
+    text = re.sub(r"[|¦\u2502\u2503\u2551\u254E\u254F]+", " ", text)
+    text = "\n".join(
+        " ".join(line.split())
+        for line in text.splitlines()
+        if line.strip() and not is_probable_ocr_noise(" ".join(line.split()))
+    ).strip()
     if not text:
         return False
 
     words = re.findall(r"[A-Za-z]+", text)
-    # Prefer real words; 3-letter lowercase OCR crumbs are not enough alone.
-    if any(len(word) >= 4 for word in words):
+    real_words = [
+        word
+        for word in words
+        if len(word) >= 3 and not is_gibberish_token(word)
+    ]
+    # Prefer real words; ignore hallucinated OCR crumbs.
+    if real_words:
         return True
 
     # Allow uppercase codes such as INR / USA / HUF.
@@ -422,7 +712,7 @@ def has_meaningful_cell_content(value: str | None) -> bool:
 
     protected = {
         "and", "the", "for", "not", "yes", "nil", "ltd", "pvt", "huf",
-        "mr", "mrs", "ms", "dr", "no", "sr",
+        "mr", "mrs", "ms", "dr", "no", "sr", "qty", "nos", "amt", "ref",
     }
     if any(word.lower() in protected for word in words):
         return True
@@ -430,8 +720,8 @@ def has_meaningful_cell_content(value: str | None) -> bool:
     # Do not discard a valid date, amount, percentage, or other numeric field
     # merely because its column header was missed by OCR.
     return bool(
-        re.fullmatch(r"[\d\s,./:%()\-]+", text)
-        and re.search(r"\d", text)
+        re.search(r"\d", text)
+        and re.fullmatch(r"[\d\s,./:%()\-A-Za-z]+", text)
     )
 
 
@@ -537,6 +827,135 @@ def prune_generated_columns(
     return new_data, new_merges
 
 
+def rows_look_like_duplicates(
+    first_row: list[str],
+    second_row: list[str],
+) -> bool:
+    comparable_pairs = 0
+    matching_pairs = 0
+    meaningful_first = 0
+    meaningful_second = 0
+
+    for first_cell, second_cell in zip(first_row, second_row, strict=False):
+        first_text = cleanup_extracted_cell_text(first_cell)
+        second_text = cleanup_extracted_cell_text(second_cell)
+
+        first_meaningful = has_meaningful_cell_content(first_text)
+        second_meaningful = has_meaningful_cell_content(second_text)
+        meaningful_first += int(first_meaningful)
+        meaningful_second += int(second_meaningful)
+
+        if not first_meaningful and not second_meaningful:
+            continue
+
+        comparable_pairs += 1
+        if first_text == second_text:
+            matching_pairs += 1
+            continue
+
+        if first_text and second_text and (
+            first_text in second_text or second_text in first_text
+        ):
+            matching_pairs += 1
+
+    minimum_meaningful = min(meaningful_first, meaningful_second)
+    if minimum_meaningful < 2 or comparable_pairs == 0:
+        return False
+
+    coverage = matching_pairs / comparable_pairs
+    return coverage >= 0.75
+
+
+def merge_similar_rows(
+    first_row: list[str],
+    second_row: list[str],
+) -> list[str]:
+    merged: list[str] = []
+    column_count = max(len(first_row), len(second_row))
+
+    for index in range(column_count):
+        first_cell = first_row[index] if index < len(first_row) else ""
+        second_cell = second_row[index] if index < len(second_row) else ""
+        first_text = cleanup_extracted_cell_text(first_cell)
+        second_text = cleanup_extracted_cell_text(second_cell)
+
+        if not first_text:
+            merged.append(second_text)
+            continue
+        if not second_text:
+            merged.append(first_text)
+            continue
+
+        first_meaningful = has_meaningful_cell_content(first_text)
+        second_meaningful = has_meaningful_cell_content(second_text)
+
+        if first_meaningful and not second_meaningful:
+            merged.append(first_text)
+        elif second_meaningful and not first_meaningful:
+            merged.append(second_text)
+        elif len(second_text) > len(first_text) and first_text in second_text:
+            merged.append(second_text)
+        else:
+            merged.append(first_text)
+
+    return merged
+
+
+def deduplicate_adjacent_rows(
+    data: list[list[str]],
+    merge_ranges: list[tuple[int, int, int, int]],
+) -> tuple[list[list[str]], list[tuple[int, int, int, int]]]:
+    if len(data) < 2:
+        return data, merge_ranges
+
+    new_data: list[list[str]] = []
+    index_map: dict[int, int] = {}
+    source_index = 0
+
+    while source_index < len(data):
+        current_row = data[source_index]
+
+        if (
+            source_index + 1 < len(data)
+            and rows_look_like_duplicates(current_row, data[source_index + 1])
+        ):
+            current_row = merge_similar_rows(current_row, data[source_index + 1])
+            index_map[source_index] = len(new_data)
+            index_map[source_index + 1] = len(new_data)
+            new_data.append(current_row)
+            source_index += 2
+            continue
+
+        index_map[source_index] = len(new_data)
+        new_data.append(current_row)
+        source_index += 1
+
+    if len(new_data) == len(data):
+        return data, merge_ranges
+
+    new_merges: list[tuple[int, int, int, int]] = []
+    for row_start, row_end, column_start, column_end in merge_ranges:
+        mapped_rows = [
+            index_map[index]
+            for index in range(row_start, row_end + 1)
+            if index in index_map
+        ]
+        if not mapped_rows:
+            continue
+
+        new_merges.append(
+            (
+                min(mapped_rows),
+                max(mapped_rows),
+                column_start,
+                column_end,
+            )
+        )
+
+    print(f"  Collapsed {len(data) - len(new_data)} duplicate/noisy row(s).")
+    return new_data, new_merges
+
+
 # Example adapter for your existing OCR:
 #
 # def my_existing_ocr(cell_image: Image.Image) -> str:
@@ -579,8 +998,29 @@ def prepare_rows_columns_and_spans(
     columns = remove_duplicate_detections(columns, iou_threshold=0.85)
     spans = remove_duplicate_detections(spans, iou_threshold=0.85)
 
+    rows = collapse_nearby_structure_detections(rows, axis="row")
+    columns = collapse_nearby_structure_detections(columns, axis="column")
+
     rows.sort(key=lambda item: (item.box[1] + item.box[3]) / 2)
     columns.sort(key=lambda item: (item.box[0] + item.box[2]) / 2)
+
+    if columns:
+        widths = [max(1.0, column.box[2] - column.box[0]) for column in columns]
+        median_width = median(widths)
+        filtered_columns: list[Detection] = []
+
+        for index, column in enumerate(columns):
+            width = column.box[2] - column.box[0]
+            if index == 0:
+                filtered_columns.append(column)
+                continue
+
+            suspiciously_narrow = width <= max(5.0, median_width * 0.18)
+            if suspiciously_narrow:
+                continue
+            filtered_columns.append(column)
+
+        columns = filtered_columns or columns
 
     return rows, columns, spans
 
@@ -711,7 +1151,39 @@ def extract_grid(
             y2 = max(y1, y2 - CELL_INSET)
 
             cell_image = table_image.crop((x1, y1, x2, y2))
-            data[row_index][column_index] = ocr_function(cell_image)
+            cell_text = ocr_function(cell_image)
+
+            if not cleanup_extracted_cell_text(cell_text):
+                # Retry 1: slightly expanded crop (helps clipped characters).
+                retry_box = clamp_box(
+                    (
+                        x1 - CELL_INSET,
+                        y1 - CELL_INSET,
+                        x2 + CELL_INSET,
+                        y2 + CELL_INSET,
+                    ),
+                    table_image.width,
+                    table_image.height,
+                )
+                retry_image = table_image.crop(retry_box)
+                retry_text = ocr_function(retry_image)
+                if cleanup_extracted_cell_text(retry_text):
+                    cell_text = retry_text
+                else:
+                    # Retry 2: original intersection without inset, for tiny values.
+                    raw_box = grid_cell_box(
+                        row,
+                        column,
+                        table_image.width,
+                        table_image.height,
+                    )
+                    if raw_box[2] > raw_box[0] and raw_box[3] > raw_box[1]:
+                        raw_image = table_image.crop(raw_box)
+                        raw_text = ocr_function(raw_image)
+                        if cleanup_extracted_cell_text(raw_text):
+                            cell_text = raw_text
+
+            data[row_index][column_index] = cell_text
 
     merge_ranges: list[tuple[int, int, int, int]] = []
 
@@ -972,6 +1444,7 @@ def extract_tables_from_pdf(
                 for row in data
             ]
             data, merge_ranges = prune_generated_columns(data, merge_ranges)
+            data, merge_ranges = deduplicate_adjacent_rows(data, merge_ranges)
 
             write_table_sheet(
                 workbook,

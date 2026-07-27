@@ -170,12 +170,9 @@ def clean_excel_file(input_file, output_file=None):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python clean_excel_data.py <input_file.xlsx> [output_file.xlsx]")
-        sys.exit(1)
-
-    input_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else None
+    # Set input/output paths here
+    input_file = "C:/Users/Divyesh Parmar/Downloads/GRP SL02 PAYSHEET MAY-2026.pdf"
+    output_file = None  # None → writes <input>_cleaned_v3.xlsx
 
     if not os.path.exists(input_file):
         print(f"Error: file '{input_file}' not found")

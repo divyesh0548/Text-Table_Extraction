@@ -29,7 +29,7 @@ def remove_duplicate_headers_largest_content(df):
         return df_cleaned.reset_index(drop=True)
 
 table_reports = []
-pdf_file = "sample7_clean.pdf"
+pdf_file = "C:/Users/Divyesh Parmar/Downloads/GRP SL02 PAYSHEET MAY-2026.pdf"
     
 tables = camelot.read_pdf(pdf_file, pages="all", flavor="stream") 
 # tables = camelot.read_pdf(pdf_file, pages="all", flavor="lattice") 
