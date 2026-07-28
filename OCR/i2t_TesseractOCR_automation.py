@@ -17,6 +17,8 @@ from img2table.tables.objects.cell import Cell
 from img2table.tables.objects.table import Table
 import pandas as pd
 
+from env_config import get_input_pdf
+
 # OpenCV ximgproc compatibility patches
 if not hasattr(cv2.ximgproc, "niBlackThreshold"):
     def niBlackThreshold(src, maxValue, *args, **kwargs):
@@ -115,10 +117,10 @@ def get_user_input():
     """Get all user inputs at the beginning"""
     print("=== Table Extraction Automation with TesseractOCR ===\n")
 
-    # Get input path
-    # input_path = input("Enter the path to your PDF or image file: ").strip()
-    input_path = "Aarti - Mandays Apr 26.pdf"
-    # input_path = "Current-Test/MBP 1 GG 2026.pdf"
+    # PDF path comes from OCR/.env (INPUT_PDF).
+    # Existing enhance/reduce flows already convert PDF pages to images when needed.
+    input_path = str(get_input_pdf())
+    print(f"Input from .env: {Path(input_path).resolve()}")
 
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input file not found: {Path(input_path).resolve()}")

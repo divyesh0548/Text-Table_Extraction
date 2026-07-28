@@ -7,3 +7,5 @@ pymupdf
 pillow
 openpyxl
 pytesseract
+easyocr
+python-dotenv

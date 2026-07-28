@@ -50,7 +50,7 @@ Orientation = Literal["horizontal", "vertical"]
 # CONFIGURATION — set paths here, then run the script
 # =============================================================================
 
-INPUT_PDF = Path("Current-Test/MBP_1_CRA.pdf")
+INPUT_PDF = Path("Current-Test/MBP_1_AKB.pdf")
 # Leave None to auto-name: <input_stem>_safe_table_lines.pdf
 OUTPUT_PDF: Path | None = None
 

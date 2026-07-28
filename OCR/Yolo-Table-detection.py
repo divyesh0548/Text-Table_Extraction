@@ -14,12 +14,14 @@ from PIL import Image, ImageDraw
 from pytesseract import Output
 from ultralyticsplus import YOLO, render_result
 
+from env_config import get_input_pdf
+
 pd.set_option("display.max_rows", 500)
 pd.set_option("display.max_columns", 500)
 pd.set_option("display.width", 1000)
 
-# INPUT_SOURCE = Path("./page_1.png")
-INPUT_SOURCE = Path("Aarti - Mandays Apr 26.pdf")
+# PDF path comes from OCR/.env (INPUT_PDF). YOLO converts PDF pages to images first.
+INPUT_SOURCE = get_input_pdf()
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 PDF_RENDER_DPI = 300
 

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+# Keep each Tesseract worker single-threaded so parallel cell OCR can use the CPU.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 import fitz  # PyMuPDF
 import pytesseract
@@ -14,13 +19,14 @@ from openpyxl.utils import get_column_letter
 from PIL import Image, ImageDraw
 from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 
+from env_config import get_input_pdf
+
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-INPUT_PDF = Path(r"Aarti - Mandays Apr 26.pdf")
-# INPUT_PDF = Path("MBP 1 GG 2026_enhanced_reduced.pdf")
+INPUT_PDF = get_input_pdf()
 OUTPUT_XLSX = Path("extracted_tables.xlsx")
 DEBUG_DIR = Path(__file__).resolve().parent / "table_debug"
 
@@ -35,6 +41,9 @@ STRUCTURE_THRESHOLD = 0.60
 
 TABLE_PADDING = 12
 CELL_INSET = 2
+
+# Parallel OCR workers. Accuracy-neutral; only changes throughput.
+OCR_WORKERS = max(1, min(8, (os.cpu_count() or 4)))
 
 # Uncomment and update this on Windows only when tesseract.exe is not in PATH.
 # This is unnecessary after replacing default_ocr() with your existing OCR.
@@ -165,7 +174,11 @@ class TableTransformerEngine:
             "cuda" if torch.cuda.is_available() else "cpu"
         )
 
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+
         print(f"Using device: {self.device}")
+        print(f"OCR workers: {OCR_WORKERS}")
 
         self.detection_processor = AutoImageProcessor.from_pretrained(
             DETECTION_MODEL_NAME
@@ -245,8 +258,9 @@ class TableTransformerEngine:
 
     @staticmethod
     def _move_inputs_to_device(inputs: dict, device: torch.device) -> dict:
+        non_blocking = device.type == "cuda"
         return {
-            key: value.to(device)
+            key: value.to(device, non_blocking=non_blocking)
             for key, value in inputs.items()
         }
 
@@ -509,25 +523,56 @@ def extract_grid(
         for _ in rows
     ]
 
-    for row_index, row in enumerate(rows):
-        for column_index, column in enumerate(columns):
-            x1, y1, x2, y2 = grid_cell_box(
-                row,
-                column,
-                table_image.width,
-                table_image.height,
-            )
+    def _ocr_one_cell(
+        row_index: int,
+        column_index: int,
+        row: Detection,
+        column: Detection,
+    ) -> tuple[int, int, str]:
+        x1, y1, x2, y2 = grid_cell_box(
+            row,
+            column,
+            table_image.width,
+            table_image.height,
+        )
 
-            if x2 <= x1 or y2 <= y1:
-                continue
+        if x2 <= x1 or y2 <= y1:
+            return row_index, column_index, ""
 
-            x1 = min(x2, x1 + CELL_INSET)
-            y1 = min(y2, y1 + CELL_INSET)
-            x2 = max(x1, x2 - CELL_INSET)
-            y2 = max(y1, y2 - CELL_INSET)
+        x1 = min(x2, x1 + CELL_INSET)
+        y1 = min(y2, y1 + CELL_INSET)
+        x2 = max(x1, x2 - CELL_INSET)
+        y2 = max(y1, y2 - CELL_INSET)
 
-            cell_image = table_image.crop((x1, y1, x2, y2))
-            data[row_index][column_index] = ocr_function(cell_image)
+        cell_image = table_image.crop((x1, y1, x2, y2))
+        return row_index, column_index, ocr_function(cell_image)
+
+    cell_jobs = [
+        (row_index, column_index, row, column)
+        for row_index, row in enumerate(rows)
+        for column_index, column in enumerate(columns)
+    ]
+
+    if len(cell_jobs) <= 1 or OCR_WORKERS <= 1:
+        for row_index, column_index, row, column in cell_jobs:
+            _, _, text = _ocr_one_cell(row_index, column_index, row, column)
+            data[row_index][column_index] = text
+    else:
+        workers = min(OCR_WORKERS, len(cell_jobs))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    _ocr_one_cell,
+                    row_index,
+                    column_index,
+                    row,
+                    column,
+                )
+                for row_index, column_index, row, column in cell_jobs
+            ]
+            for future in as_completed(futures):
+                row_index, column_index, text = future.result()
+                data[row_index][column_index] = text
 
     merge_ranges: list[tuple[int, int, int, int]] = []
 

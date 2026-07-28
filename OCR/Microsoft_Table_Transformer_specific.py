@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
+from threading import Lock
 from typing import Callable
 
+# Keep each Tesseract worker single-threaded so parallel cell OCR can use the CPU.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
 import fitz  # PyMuPDF
+import numpy as np
 import pytesseract
 import torch
 from openpyxl import Workbook
@@ -15,13 +21,14 @@ from openpyxl.utils import get_column_letter
 from PIL import Image, ImageDraw, ImageOps
 from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 
+from env_config import get_input_pdf
+
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-# INPUT_PDF = Path("Current-Test/MBP 1 RKB 2026.pdf")
-INPUT_PDF = Path(r"Aarti-Mandays May 26.pdf")
+INPUT_PDF = get_input_pdf()
 OUTPUT_XLSX = Path("extracted_tables.xlsx")
 DEBUG_DIR = Path(__file__).resolve().parent / "table_debug"
 
@@ -37,12 +44,46 @@ STRUCTURE_THRESHOLD = 0.60
 TABLE_PADDING = 12
 CELL_INSET = 2
 
+# Parallel OCR workers. Accuracy-neutral; only changes throughput.
+OCR_WORKERS = max(1, min(8, (os.cpu_count() or 4)))
+# Stop trying more OCR variants once a strong result is found.
+OCR_EARLY_EXIT_CONFIDENCE = 70.0
+
+# Choose text OCR engine: "tesseract" or "easyocr"
+OCR_ENGINE = "easyocr"
+# Process multiple PDF pages concurrently. Keep this modest because each page
+# worker holds its own table-detection/structure models in memory.
+PAGE_WORKERS = max(1, min(2, (os.cpu_count() or 4)))
+
 # Uncomment and update this on Windows only when tesseract.exe is not in PATH.
 # This is unnecessary after replacing default_ocr() with your existing OCR.
 #
 pytesseract.pytesseract.tesseract_cmd = (
     r"C:\Users\Divyesh Parmar\Downloads\Tesserect OCR\tesseract.exe"
 )
+
+
+def effective_ocr_workers() -> int:
+    """
+    Return the useful OCR parallelism for the selected engine.
+
+    EasyOCR on CPU is internally heavy and uses a shared reader lock below, so
+    high outer parallelism only adds contention and startup overhead.
+    """
+    engine = str(OCR_ENGINE or "tesseract").strip().lower()
+    if engine == "easyocr":
+        return min(2, OCR_WORKERS) if torch.cuda.is_available() else 1
+    return OCR_WORKERS
+
+
+def effective_page_workers() -> int:
+    """
+    Return page-level parallelism.
+
+    GPU model inference should stay single-page to avoid contention/VRAM spikes.
+    CPU inference can benefit from a small number of concurrent page workers.
+    """
+    return 1 if torch.cuda.is_available() else PAGE_WORKERS
 
 
 @dataclass(frozen=True)
@@ -239,15 +280,24 @@ class TableTransformerEngine:
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        # HuggingFace model inference is not safely concurrent across threads.
+        self._inference_lock = Lock()
+
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
 
         print(f"Using device: {self.device}")
+        print(f"OCR engine: {OCR_ENGINE}")
+        print(f"OCR workers: {effective_ocr_workers()}")
 
         self.detection_processor = AutoImageProcessor.from_pretrained(
             DETECTION_MODEL_NAME
         )
+        # Avoid meta-tensor loads (accelerate/low_cpu_mem_usage) that break .to().
         self.detection_model = (
             TableTransformerForObjectDetection.from_pretrained(
-                DETECTION_MODEL_NAME
+                DETECTION_MODEL_NAME,
+                low_cpu_mem_usage=False,
             )
             .to(self.device)
             .eval()
@@ -263,7 +313,8 @@ class TableTransformerEngine:
 
         self.structure_model = (
             TableTransformerForObjectDetection.from_pretrained(
-                STRUCTURE_MODEL_NAME
+                STRUCTURE_MODEL_NAME,
+                low_cpu_mem_usage=False,
             )
             .to(self.device)
             .eval()
@@ -320,36 +371,38 @@ class TableTransformerEngine:
 
     @staticmethod
     def _move_inputs_to_device(inputs: dict, device: torch.device) -> dict:
+        non_blocking = device.type == "cuda"
         return {
-            key: value.to(device)
+            key: value.to(device, non_blocking=non_blocking)
             for key, value in inputs.items()
         }
 
     def detect_tables(self, page_image: Image.Image) -> list[Detection]:
-        inputs = self.detection_processor(
-            images=page_image,
-            return_tensors="pt",
-        )
-        inputs = self._move_inputs_to_device(inputs, self.device)
+        with self._inference_lock:
+            inputs = self.detection_processor(
+                images=page_image,
+                return_tensors="pt",
+            )
+            inputs = self._move_inputs_to_device(inputs, self.device)
 
-        with torch.inference_mode():
-            outputs = self.detection_model(**inputs)
+            with torch.inference_mode():
+                outputs = self.detection_model(**inputs)
 
-        target_sizes = torch.tensor(
-            [[page_image.height, page_image.width]],
-            device=self.device,
-        )
+            target_sizes = torch.tensor(
+                [[page_image.height, page_image.width]],
+                device=self.device,
+            )
 
-        result = self.detection_processor.post_process_object_detection(
-            outputs,
-            threshold=DETECTION_THRESHOLD,
-            target_sizes=target_sizes,
-        )[0]
+            result = self.detection_processor.post_process_object_detection(
+                outputs,
+                threshold=DETECTION_THRESHOLD,
+                target_sizes=target_sizes,
+            )[0]
 
-        detections = self._decode_results(
-            result,
-            self.detection_model.config.id2label,
-        )
+            detections = self._decode_results(
+                result,
+                self.detection_model.config.id2label,
+            )
 
         detections = [
             item
@@ -366,66 +419,129 @@ class TableTransformerEngine:
         self,
         table_image: Image.Image,
     ) -> list[Detection]:
-        inputs = self.structure_processor(
-            images=table_image,
-            return_tensors="pt",
-        )
-        inputs = self._move_inputs_to_device(inputs, self.device)
+        with self._inference_lock:
+            inputs = self.structure_processor(
+                images=table_image,
+                return_tensors="pt",
+            )
+            inputs = self._move_inputs_to_device(inputs, self.device)
 
-        with torch.inference_mode():
-            outputs = self.structure_model(**inputs)
+            with torch.inference_mode():
+                outputs = self.structure_model(**inputs)
 
-        target_sizes = torch.tensor(
-            [[table_image.height, table_image.width]],
-            device=self.device,
-        )
+            target_sizes = torch.tensor(
+                [[table_image.height, table_image.width]],
+                device=self.device,
+            )
 
-        result = self.structure_processor.post_process_object_detection(
-            outputs,
-            threshold=STRUCTURE_THRESHOLD,
-            target_sizes=target_sizes,
-        )[0]
+            result = self.structure_processor.post_process_object_detection(
+                outputs,
+                threshold=STRUCTURE_THRESHOLD,
+                target_sizes=target_sizes,
+            )[0]
 
-        return self._decode_results(
-            result,
-            self.structure_model.config.id2label,
-        )
+            return self._decode_results(
+                result,
+                self.structure_model.config.id2label,
+            )
 
 
 # =============================================================================
 # OCR ADAPTER
 # =============================================================================
 
+def cell_ink_stats(
+    cell_image: Image.Image,
+    dark_threshold: int = 170,
+) -> tuple[float, int, bool]:
+    """
+    Return (ink_ratio, dark_pixel_count, looks_like_grid_line_only).
+
+    Grid-line-only crops are treated as blank even if they have dark pixels.
+    Thin real glyphs like "1" are NOT treated as grid lines.
+    """
+    gray = cell_image.convert("L")
+    width, height = gray.size
+    if width < 2 or height < 2:
+        return 0.0, 0, True
+
+    inset_x = max(1, min(2, width // 12))
+    inset_y = max(1, min(2, height // 12))
+    if width > 2 * inset_x and height > 2 * inset_y:
+        gray = gray.crop(
+            (inset_x, inset_y, width - inset_x, height - inset_y)
+        )
+
+    pixels = np.asarray(gray, dtype=np.uint8)
+    inner_h, inner_w = pixels.shape
+    total_pixels = pixels.size or 1
+    dark = pixels < dark_threshold
+    dark_pixels = int(dark.sum())
+    ink_ratio = dark_pixels / total_pixels
+
+    if dark_pixels == 0:
+        return 0.0, 0, False
+
+    col_counts = dark.sum(axis=0)
+    row_counts = dark.sum(axis=1)
+
+    # Border-band test: true grid lines sit on the cell edge, not the center.
+    x_band = max(1, inner_w // 8)
+    y_band = max(1, inner_h // 8)
+
+    left_dark = int(col_counts[:x_band].sum())
+    right_dark = int(col_counts[-x_band:].sum())
+    center_col_dark = (
+        int(col_counts[x_band:-x_band].sum()) if inner_w > 2 * x_band else 0
+    )
+    top_dark = int(row_counts[:y_band].sum())
+    bottom_dark = int(row_counts[-y_band:].sum())
+    center_row_dark = (
+        int(row_counts[y_band:-y_band].sum()) if inner_h > 2 * y_band else 0
+    )
+
+    looks_like_vertical_line = (
+        dark_pixels >= max(8, inner_h // 4)
+        and (left_dark + right_dark) >= int(0.80 * dark_pixels)
+        and center_col_dark <= int(0.20 * dark_pixels)
+    )
+    looks_like_horizontal_line = (
+        dark_pixels >= max(8, inner_w // 4)
+        and (top_dark + bottom_dark) >= int(0.80 * dark_pixels)
+        and center_row_dark <= int(0.20 * dark_pixels)
+    )
+    looks_like_grid_line = looks_like_vertical_line or looks_like_horizontal_line
+    return ink_ratio, dark_pixels, looks_like_grid_line
+
+
 def cell_has_visible_ink(
     cell_image: Image.Image,
     dark_threshold: int = 170,
-    minimum_ink_ratio: float = 0.005,
+    minimum_ink_ratio: float = 0.006,
     minimum_dark_pixels: int = 8,
 ) -> bool:
     """
     Return True when a cell crop contains enough dark pixels to justify OCR.
 
     Ignores a thin border so table grid lines alone do not count as content.
-    Thresholds are intentionally soft so faint/small text is still OCR'd.
     """
-    gray = cell_image.convert("L")
-    width, height = gray.size
-    if width < 2 or height < 2:
+    ink_ratio, dark_pixels, looks_like_grid_line = cell_ink_stats(
+        cell_image,
+        dark_threshold=dark_threshold,
+    )
+    if looks_like_grid_line:
         return False
-
-    inset_x = max(1, min(3, width // 10))
-    inset_y = max(1, min(3, height // 10))
-    if width > 2 * inset_x and height > 2 * inset_y:
-        gray = gray.crop(
-            (inset_x, inset_y, width - inset_x, height - inset_y)
-        )
-
-    histogram = gray.histogram()
-    total_pixels = sum(histogram) or 1
-    dark_pixels = sum(histogram[:dark_threshold])
     if dark_pixels < minimum_dark_pixels:
         return False
-    return (dark_pixels / total_pixels) >= minimum_ink_ratio
+    return ink_ratio >= minimum_ink_ratio
+
+
+def cell_is_definitely_blank(cell_image: Image.Image) -> bool:
+    """Strict blank check used to skip OCR / clear invented text."""
+    ink_ratio, dark_pixels, looks_like_grid_line = cell_ink_stats(cell_image)
+    if looks_like_grid_line:
+        return True
+    return dark_pixels < 4 or ink_ratio < 0.002
 
 
 def ocr_with_confidence(
@@ -518,17 +634,18 @@ def is_gibberish_token(token: str) -> bool:
     ):
         return True
 
+    # Short all-lowercase unknown tokens are common blank-cell hallucinations.
+    if token.islower() and 3 <= len(token) <= 6 and word not in protected:
+        return True
+
     return False
 
 
-def default_ocr(cell_image: Image.Image) -> str:
+def tesseract_ocr(cell_image: Image.Image) -> str:
     """
-    Standalone OCR implementation using Tesseract.
+    Cell OCR using Tesseract (pytesseract).
 
-    Replace only this function with your existing OCR implementation.
-    The replacement must:
-      1. Accept a PIL.Image.Image.
-      2. Return the recognized text as a string.
+    Accepts a PIL.Image.Image and returns recognized text as a string.
     """
     if cell_image.width < 2 or cell_image.height < 2:
         return ""
@@ -560,51 +677,148 @@ def default_ocr(cell_image: Image.Image) -> str:
         if not cleaned:
             return (-1, -1, -1)
 
-        # Prefer meaningful content, but still accept valid short cleaned values.
-        meaningful_bonus = 10 if has_meaningful_cell_content(cleaned) else 1
+        # Never prefer OCR junk over an empty cell.
+        if not has_meaningful_cell_content(cleaned):
+            return (-1, -1, -1)
+
         alnum_count = sum(character.isalnum() for character in cleaned)
         length_score = len(cleaned.replace(" ", ""))
-        return (meaningful_bonus, alnum_count, length_score)
+        return (10, alnum_count, length_score)
 
     best_text = ""
     best_score = (-1, -1, -1)
+    best_confidence = -1.0
 
+    # Same variants/PSMs as before, but stop early once a strong result is found.
     for image_variant in (contrasted, thresholded):
-        # Avoid PSM 11 (sparse text): it hallucinates on blank cells.
-        for psm in (6, 7):
+        for psm in (6, 7, 8):
             config = f"--oem 3 --psm {psm}"
             text, mean_confidence = ocr_with_confidence(
                 image_variant,
                 config=config,
             )
-            # Soft threshold so faint but real digits/text are kept.
-            if text and mean_confidence < 35.0:
+            normalized = normalize_text(text)
+            cleaned = cleanup_extracted_cell_text(normalized)
+            if not cleaned:
                 continue
 
-            normalized = normalize_text(text)
+            # Digits/dates and placeholders can be valid at lower confidence.
+            if is_legitimate_placeholder(cleaned):
+                min_confidence = 25.0
+            elif re.search(r"\d", cleaned):
+                min_confidence = 35.0
+            else:
+                min_confidence = 42.0
+            if mean_confidence < min_confidence:
+                continue
+
             score = score_text(normalized)
             if score > best_score:
                 best_score = score
                 best_text = normalized
+                best_confidence = mean_confidence
 
-            # Fallback when confidence path is empty/too strict.
-            if score <= (-1, -1, -1):
-                fallback = normalize_text(
-                    pytesseract.image_to_string(
-                        image_variant,
-                        config=config,
-                    )
-                )
-                fallback_score = score_text(fallback)
-                if fallback_score > best_score:
-                    best_score = fallback_score
-                    best_text = fallback
+                if best_confidence >= OCR_EARLY_EXIT_CONFIDENCE:
+                    return best_text
 
     return best_text
 
 
+_easyocr_reader = None
+_easyocr_lock = Lock()
+
+
+def get_easyocr_reader():
+    """Lazy-load a shared EasyOCR reader (expensive to create)."""
+    global _easyocr_reader
+    if _easyocr_reader is None:
+        with _easyocr_lock:
+            if _easyocr_reader is None:
+                try:
+                    import easyocr
+                except ModuleNotFoundError as exc:
+                    raise ModuleNotFoundError(
+                        "EasyOCR is not installed. Run: pip install easyocr"
+                    ) from exc
+
+                use_gpu = torch.cuda.is_available()
+                print(f"Loading EasyOCR reader (gpu={use_gpu})...")
+                _easyocr_reader = easyocr.Reader(["en"], gpu=use_gpu)
+    return _easyocr_reader
+
+
+def easyocr_ocr(cell_image: Image.Image) -> str:
+    """
+    Cell OCR using EasyOCR (same style as OCR/EOCR.py).
+
+    Accepts a PIL.Image.Image and returns recognized text as a string.
+    """
+    if cell_image.width < 2 or cell_image.height < 2:
+        return ""
+
+    if not cell_has_visible_ink(cell_image):
+        return ""
+
+    enlarged = cell_image.resize(
+        (
+            max(2, cell_image.width * 2),
+            max(2, cell_image.height * 2),
+        ),
+        Image.Resampling.LANCZOS,
+    ).convert("RGB")
+    img_array = np.array(enlarged)
+
+    reader = get_easyocr_reader()
+    with _easyocr_lock:
+        results = reader.readtext(img_array, detail=0, paragraph=False)
+
+    lines = [
+        " ".join(str(line).split())
+        for line in results
+        if str(line).strip()
+    ]
+    return "\n".join(lines).strip()
+
+
+def resolve_ocr_function() -> Callable[[Image.Image], str]:
+    """Return the OCR function selected by OCR_ENGINE."""
+    engine = str(OCR_ENGINE or "tesseract").strip().lower()
+    if engine == "tesseract":
+        return tesseract_ocr
+    if engine == "easyocr":
+        return easyocr_ocr
+    raise ValueError(
+        f'Unsupported OCR_ENGINE={OCR_ENGINE!r}. '
+        'Use "tesseract" or "easyocr".'
+    )
+
+
+# Backward-compatible alias used by extract_tables_from_pdf default arg.
+default_ocr = tesseract_ocr
+
+
+LEGITIMATE_CELL_PLACEHOLDERS = {
+    "-",
+    "–",
+    "—",
+    "nil",
+    "n/a",
+    "na",
+    "none",
+    "null",
+}
+
+
+def is_legitimate_placeholder(value: str | None) -> bool:
+    text = str(value or "").strip().lower()
+    return text in LEGITIMATE_CELL_PLACEHOLDERS
+
+
 def is_probable_ocr_noise(line: str) -> bool:
     """Identify OCR fragments without removing normal cell values."""
+    if is_legitimate_placeholder(line):
+        return False
+
     tokens = re.findall(r"[A-Za-z0-9]+", line.lower())
     if not tokens:
         # Symbols-only cells such as "{" are not real table values.
@@ -668,16 +882,103 @@ def is_probable_ocr_noise(line: str) -> bool:
     )
 
 
+def remove_noise_symbol_patterns(text: str) -> str:
+    """
+    Remove continuous / patterned OCR noise symbols while keeping useful punctuation.
+
+    Examples removed:
+      "~—_ ."
+      "~~__"
+      "_ _ ."
+      "...."
+
+    Examples kept:
+      "12.50"
+      "10%"
+      "2024-05-01"
+      "A-1"
+      "-"
+      "Nil"
+    """
+    if not text:
+        return ""
+
+    stripped = text.strip()
+    if is_legitimate_placeholder(stripped):
+        return "-" if stripped in {"-", "–", "—"} else stripped
+
+    noise_chars = r"~`^¬¦|•·…—–_=*#@∞¤§±\"'‹›«»˚¨´"
+    noise_or_filler = rf"[{noise_chars}.\-]"
+
+    # Whole-cell / whole-line is only decorative symbols (but not a lone "-").
+    if (
+        re.fullmatch(rf"[\s{noise_chars}.\-]+", text)
+        and not re.search(r"[A-Za-z0-9]", text)
+        and not is_legitimate_placeholder(stripped)
+    ):
+        return ""
+
+    # Continuous noise run: "~—_", "___", "~~~"
+    text = re.sub(rf"[{noise_chars}]{{2,}}", " ", text)
+
+    # Repeated same filler punctuation: "....", "----", "===="
+    text = re.sub(r"([.\-_=~—–])\1+", " ", text)
+
+    # Spaced symbol patterns: "~ — _ ." or "_ . ~ —"
+    text = re.sub(
+        rf"(?:(?<=\s)|^){noise_or_filler}(?:\s+{noise_or_filler}){{1,}}(?=\s|$)",
+        " ",
+        text,
+    )
+
+    cleaned_tokens: list[str] = []
+    for token in text.split():
+        if is_legitimate_placeholder(token):
+            cleaned_tokens.append("-" if token in {"-", "–", "—"} else token)
+            continue
+
+        # Drop tokens that are only noise/filler symbols.
+        if re.fullmatch(rf"[{noise_chars}.\-]+", token):
+            # Keep a lone meaningful unit marker if it appears alone.
+            if token == "%":
+                cleaned_tokens.append(token)
+            continue
+
+        # Strip leading/trailing decorative symbols, keep inner useful punctuation.
+        token = re.sub(rf"^[{noise_chars}]+", "", token)
+        token = re.sub(rf"[{noise_chars}]+$", "", token)
+
+        # Remove internal continuous noise chunks inside a mixed token.
+        token = re.sub(rf"[{noise_chars}]{{2,}}", "", token)
+
+        if not token:
+            continue
+        if re.fullmatch(rf"[{noise_chars}.\-]+", token):
+            continue
+
+        cleaned_tokens.append(token)
+
+    return " ".join(cleaned_tokens).strip()
+
+
 def cleanup_extracted_cell_text(value: str | None) -> str:
     """Remove OCR-only symbols and clearly meaningless text lines."""
     text = str(value or "")
+    if is_legitimate_placeholder(text.strip()):
+        return "-" if text.strip() in {"-", "–", "—"} else text.strip()
+
     # Vertical grid lines are OCR artefacts, not table content.
     text = re.sub(r"[|¦\u2502\u2503\u2551\u254E\u254F]+", " ", text)
 
     kept_lines = []
     for line in text.splitlines():
         normalized = " ".join(line.split())
-        if normalized and not is_probable_ocr_noise(normalized):
+        normalized = remove_noise_symbol_patterns(normalized)
+        if not normalized:
+            continue
+        if is_legitimate_placeholder(normalized) or not is_probable_ocr_noise(
+            normalized
+        ):
             kept_lines.append(normalized)
 
     return "\n".join(kept_lines).strip()
@@ -685,16 +986,31 @@ def cleanup_extracted_cell_text(value: str | None) -> str:
 
 def has_meaningful_cell_content(value: str | None) -> bool:
     """Return whether a cleaned cell contains real table content."""
+    if is_legitimate_placeholder(value):
+        return True
+
     # Use lightweight cleanup here to avoid recursion with cleanup_extracted_cell_text.
     text = str(value or "")
     text = re.sub(r"[|¦\u2502\u2503\u2551\u254E\u254F]+", " ", text)
     text = "\n".join(
-        " ".join(line.split())
+        remove_noise_symbol_patterns(" ".join(line.split()))
         for line in text.splitlines()
-        if line.strip() and not is_probable_ocr_noise(" ".join(line.split()))
+        if line.strip()
+    )
+    text = "\n".join(
+        line
+        for line in text.splitlines()
+        if line.strip()
+        and (
+            is_legitimate_placeholder(line.strip())
+            or not is_probable_ocr_noise(line.strip())
+        )
     ).strip()
     if not text:
         return False
+
+    if is_legitimate_placeholder(text):
+        return True
 
     words = re.findall(r"[A-Za-z]+", text)
     real_words = [
@@ -732,39 +1048,66 @@ def _column_values(data: list[list[str]], column_index: int) -> list[str]:
     ]
 
 
+def _cell_is_real_content(value: str | None) -> bool:
+    """True for real text or legitimate placeholders like '-', 'Nil'."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if is_legitimate_placeholder(text):
+        return True
+    return has_meaningful_cell_content(text)
+
+
+def _cell_is_noise_or_null(value: str | None) -> bool:
+    """True for empty/null cells or OCR noise fragments."""
+    text = str(value or "").strip()
+    if not text:
+        return True
+    if is_legitimate_placeholder(text):
+        return False
+    return not has_meaningful_cell_content(text)
+
+
+def _header_is_noisy(header: str | None) -> bool:
+    """Empty headers are not noisy; only gibberish/OCR crumbs count."""
+    text = str(header or "").strip()
+    if not text:
+        return False
+    if is_legitimate_placeholder(text):
+        return False
+    if has_meaningful_cell_content(text):
+        return False
+    return True
+
+
 def is_junk_generated_column(values: list[str]) -> bool:
     """
-    Detect phantom columns created from grid-line OCR crumbs.
+    Drop a column only when its header is noisy AND every cell is noise/null.
 
-    Typical pattern: empty header + short fragments (ira / fe / mit / ode).
+    Sparse real columns (many empty cells, a few real values, or mostly
+    '-' / 'Nil') must always be kept.
     """
     if not values:
         return True
 
-    header = cleanup_extracted_cell_text(values[0])
-    body = values[1:] if len(values) > 1 else []
-
-    meaningful_body = [
-        cell for cell in body if has_meaningful_cell_content(cell)
-    ]
-    if meaningful_body:
+    # Any real content or placeholder anywhere → keep.
+    if any(_cell_is_real_content(cell) for cell in values):
         return False
 
-    # No meaningful body cells. Drop when header is also empty/noise, or when
-    # the body only had short fragments / empties.
-    if not header:
-        return True
+    header = values[0]
+    if not _header_is_noisy(header):
+        # Empty/quiet header with empty or sparse body → keep.
+        return False
 
-    # Header exists but body is empty/noise — still drop narrow phantom cols
-    # whose "header" is itself a short OCR crumb.
-    return is_probable_ocr_noise(header) or len(header) <= 3
+    # Noisy header and nothing but noise/null below → drop.
+    return all(_cell_is_noise_or_null(cell) for cell in values)
 
 
 def prune_generated_columns(
     data: list[list[str]],
     merge_ranges: list[tuple[int, int, int, int]],
     ) -> tuple[list[list[str]], list[tuple[int, int, int, int]]]:
-    """Drop non-index columns containing only empty or OCR-noise values."""
+    """Drop columns only when header is noisy and all cells are noise/null."""
     if not data or not data[0]:
         return data, merge_ranges
 
@@ -772,14 +1115,12 @@ def prune_generated_columns(
     if column_count <= 1:
         return data, merge_ranges
 
-    # The first column is normally the serial/index column and is always kept.
     keep_indices = [0]
     for column_index in range(1, column_count):
         values = _column_values(data, column_index)
         if is_junk_generated_column(values):
             continue
-        if any(has_meaningful_cell_content(cell) for cell in values):
-            keep_indices.append(column_index)
+        keep_indices.append(column_index)
 
     if len(keep_indices) == column_count:
         return data, merge_ranges
@@ -803,8 +1144,6 @@ def prune_generated_columns(
         if not mapped_columns:
             continue
 
-        # Preserve text from a merged-cell anchor if its original column was
-        # removed and the merge still has a retained column.
         if (
             column_start not in index_map
             and row_start < len(data)
@@ -822,7 +1161,7 @@ def prune_generated_columns(
         )
 
     print(
-        f"  Removed {column_count - len(keep_indices)} empty/noise column(s)."
+        f"  Removed {column_count - len(keep_indices)} noisy junk column(s)."
     )
     return new_data, new_merges
 
@@ -1004,24 +1343,6 @@ def prepare_rows_columns_and_spans(
     rows.sort(key=lambda item: (item.box[1] + item.box[3]) / 2)
     columns.sort(key=lambda item: (item.box[0] + item.box[2]) / 2)
 
-    if columns:
-        widths = [max(1.0, column.box[2] - column.box[0]) for column in columns]
-        median_width = median(widths)
-        filtered_columns: list[Detection] = []
-
-        for index, column in enumerate(columns):
-            width = column.box[2] - column.box[0]
-            if index == 0:
-                filtered_columns.append(column)
-                continue
-
-            suspiciously_narrow = width <= max(5.0, median_width * 0.18)
-            if suspiciously_narrow:
-                continue
-            filtered_columns.append(column)
-
-        columns = filtered_columns or columns
-
     return rows, columns, spans
 
 
@@ -1051,7 +1372,7 @@ def find_span_range(
     columns: list[Detection],
     table_width: int,
     table_height: int,
-    minimum_cell_overlap: float = 0.35,
+    minimum_cell_overlap: float = 0.50,
     ) -> tuple[int, int, int, int] | None:
     """
     Convert a predicted spanning-cell box into zero-based grid coordinates.
@@ -1114,6 +1435,149 @@ def ranges_overlap(
     return rows_overlap and columns_overlap
 
 
+def recover_missed_cell_text(
+    table_image: Image.Image,
+    cell_box: tuple[int, int, int, int],
+) -> str:
+    """
+    Targeted recovery for a single empty cell that still has real ink.
+
+    Blank/grid-only cells stay blank; thin real values like "1" are recovered.
+    """
+    x1, y1, x2, y2 = cell_box
+    if x2 <= x1 or y2 <= y1:
+        return ""
+
+    crop = table_image.crop((x1, y1, x2, y2))
+    if cell_is_definitely_blank(crop):
+        return ""
+    if not cell_has_visible_ink(crop):
+        # Try a tiny expansion only when the raw crop is borderline.
+        expanded = clamp_box(
+            (x1 - 2, y1 - 2, x2 + 2, y2 + 2),
+            table_image.width,
+            table_image.height,
+        )
+        crop = table_image.crop(expanded)
+        if cell_is_definitely_blank(crop) or not cell_has_visible_ink(crop):
+            return ""
+
+    scale = 3 if min(crop.width, crop.height) < 70 else 2
+    gray = crop.resize(
+        (max(1, crop.width * scale), max(1, crop.height * scale)),
+        Image.Resampling.LANCZOS,
+    ).convert("L")
+    gray = ImageOps.autocontrast(ImageOps.expand(gray, border=12, fill=255))
+
+    best_text = ""
+    best_key = (-1.0, -1, -1)
+
+    for config in (
+        "--oem 3 --psm 7",
+        "--oem 3 --psm 8",
+        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789.,-/%:",
+    ):
+        text, confidence = ocr_with_confidence(gray, config=config)
+        cleaned = cleanup_extracted_cell_text(text)
+        if not cleaned or not has_meaningful_cell_content(cleaned):
+            continue
+
+        min_confidence = 38.0 if re.search(r"\d", cleaned) else 48.0
+        if confidence < min_confidence:
+            continue
+
+        key = (
+            confidence,
+            1 if re.search(r"\d", cleaned) else 0,
+            len(re.findall(r"[A-Za-z0-9]", cleaned)),
+        )
+        if key > best_key:
+            best_key = key
+            best_text = cleaned
+            if confidence >= OCR_EARLY_EXIT_CONFIDENCE:
+                return best_text
+
+    return best_text
+
+
+def _ocr_single_grid_cell(
+    table_image: Image.Image,
+    row: Detection,
+    column: Detection,
+    ocr_function: Callable[[Image.Image], str],
+) -> str:
+    """OCR one grid cell with the same retry/recovery logic as before."""
+    raw_box = grid_cell_box(
+        row,
+        column,
+        table_image.width,
+        table_image.height,
+    )
+
+    if raw_box[2] <= raw_box[0] or raw_box[3] <= raw_box[1]:
+        return ""
+
+    x1, y1, x2, y2 = raw_box
+    x1 = min(x2, x1 + CELL_INSET)
+    y1 = min(y2, y1 + CELL_INSET)
+    x2 = max(x1, x2 - CELL_INSET)
+    y2 = max(y1, y2 - CELL_INSET)
+
+    cell_image = table_image.crop((x1, y1, x2, y2))
+    raw_image = table_image.crop(raw_box)
+
+    # Only skip OCR when the cell is truly blank / border-only.
+    if cell_is_definitely_blank(cell_image) and cell_is_definitely_blank(
+        raw_image
+    ):
+        return ""
+
+    cell_text = ""
+    if cell_has_visible_ink(cell_image) or not cell_is_definitely_blank(
+        cell_image
+    ):
+        cell_text = ocr_function(cell_image)
+
+    if not cleanup_extracted_cell_text(cell_text):
+        retry_box = clamp_box(
+            (
+                x1 - max(CELL_INSET, 2),
+                y1 - max(CELL_INSET, 2),
+                x2 + max(CELL_INSET, 2),
+                y2 + max(CELL_INSET, 2),
+            ),
+            table_image.width,
+            table_image.height,
+        )
+        retry_image = table_image.crop(retry_box)
+        if not cell_is_definitely_blank(retry_image):
+            retry_text = ocr_function(retry_image)
+            if cleanup_extracted_cell_text(retry_text):
+                cell_text = retry_text
+
+        if not cleanup_extracted_cell_text(cell_text):
+            if not cell_is_definitely_blank(raw_image):
+                raw_text = ocr_function(raw_image)
+                if cleanup_extracted_cell_text(raw_text):
+                    cell_text = raw_text
+                else:
+                    cell_text = recover_missed_cell_text(
+                        table_image,
+                        raw_box,
+                    )
+
+    # Final guard: clear only definite blanks / non-meaningful junk.
+    if cleanup_extracted_cell_text(cell_text):
+        if cell_is_definitely_blank(cell_image) and cell_is_definitely_blank(
+            raw_image
+        ):
+            return ""
+        if not has_meaningful_cell_content(cell_text):
+            return ""
+
+    return cell_text
+
+
 def extract_grid(
     table_image: Image.Image,
     rows: list[Detection],
@@ -1133,57 +1597,36 @@ def extract_grid(
         for _ in rows
     ]
 
-    for row_index, row in enumerate(rows):
-        for column_index, column in enumerate(columns):
-            x1, y1, x2, y2 = grid_cell_box(
-                row,
-                column,
-                table_image.width,
-                table_image.height,
-            )
+    cell_jobs = [
+        (row_index, column_index, row, column)
+        for row_index, row in enumerate(rows)
+        for column_index, column in enumerate(columns)
+    ]
 
-            if x2 <= x1 or y2 <= y1:
-                continue
+    def _run_job(
+        job: tuple[int, int, Detection, Detection],
+    ) -> tuple[int, int, str]:
+        row_index, column_index, row, column = job
+        text = _ocr_single_grid_cell(
+            table_image,
+            row,
+            column,
+            ocr_function,
+        )
+        return row_index, column_index, text
 
-            x1 = min(x2, x1 + CELL_INSET)
-            y1 = min(y2, y1 + CELL_INSET)
-            x2 = max(x1, x2 - CELL_INSET)
-            y2 = max(y1, y2 - CELL_INSET)
+    workers = min(effective_ocr_workers(), len(cell_jobs))
 
-            cell_image = table_image.crop((x1, y1, x2, y2))
-            cell_text = ocr_function(cell_image)
-
-            if not cleanup_extracted_cell_text(cell_text):
-                # Retry 1: slightly expanded crop (helps clipped characters).
-                retry_box = clamp_box(
-                    (
-                        x1 - CELL_INSET,
-                        y1 - CELL_INSET,
-                        x2 + CELL_INSET,
-                        y2 + CELL_INSET,
-                    ),
-                    table_image.width,
-                    table_image.height,
-                )
-                retry_image = table_image.crop(retry_box)
-                retry_text = ocr_function(retry_image)
-                if cleanup_extracted_cell_text(retry_text):
-                    cell_text = retry_text
-                else:
-                    # Retry 2: original intersection without inset, for tiny values.
-                    raw_box = grid_cell_box(
-                        row,
-                        column,
-                        table_image.width,
-                        table_image.height,
-                    )
-                    if raw_box[2] > raw_box[0] and raw_box[3] > raw_box[1]:
-                        raw_image = table_image.crop(raw_box)
-                        raw_text = ocr_function(raw_image)
-                        if cleanup_extracted_cell_text(raw_text):
-                            cell_text = raw_text
-
-            data[row_index][column_index] = cell_text
+    if len(cell_jobs) == 1 or workers <= 1:
+        for job in cell_jobs:
+            row_index, column_index, text = _run_job(job)
+            data[row_index][column_index] = text
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_run_job, job) for job in cell_jobs]
+            for future in as_completed(futures):
+                row_index, column_index, text = future.result()
+                data[row_index][column_index] = text
 
     merge_ranges: list[tuple[int, int, int, int]] = []
 
@@ -1211,6 +1654,16 @@ def extract_grid(
 
         row_start, row_end, column_start, column_end = merge_range
 
+        # Avoid false spans wiping distinct already-extracted middle cells.
+        occupied_values = {
+            cleanup_extracted_cell_text(data[row_index][column_index])
+            for row_index in range(row_start, row_end + 1)
+            for column_index in range(column_start, column_end + 1)
+            if cleanup_extracted_cell_text(data[row_index][column_index])
+        }
+        if len(occupied_values) >= 2:
+            continue
+
         x1 = min(
             columns[index].box[0]
             for index in range(column_start, column_end + 1)
@@ -1235,6 +1688,21 @@ def extract_grid(
         )
         merged_image = table_image.crop(merged_box)
         merged_text = ocr_function(merged_image)
+        cleaned_merged = cleanup_extracted_cell_text(merged_text)
+        existing_anchor = cleanup_extracted_cell_text(
+            data[row_start][column_start]
+        )
+
+        # Do not replace a good cell with empty/weaker merged OCR.
+        if not cleaned_merged:
+            continue
+        if (
+            existing_anchor
+            and existing_anchor != cleaned_merged
+            and existing_anchor not in cleaned_merged
+            and len(existing_anchor) >= len(cleaned_merged)
+        ):
+            continue
 
         data[row_start][column_start] = merged_text
 
@@ -1357,6 +1825,100 @@ def write_table_sheet(
 # MAIN PIPELINE
 # =============================================================================
 
+def process_pdf_page(
+    page_number: int,
+    page_image: Image.Image,
+    ocr_function: Callable[[Image.Image], str],
+    engine: TableTransformerEngine,
+) -> tuple[int, list[tuple[str, list[list[str]], list[tuple[int, int, int, int]]]]]:
+    """
+    Process one rendered PDF page and return extracted sheet payloads.
+
+    Workbook writes happen on the main thread; worker threads only return data.
+    Detection/structure share one engine (locked). OCR still runs per page.
+    """
+    tables = engine.detect_tables(page_image)
+
+    print(
+        f"Page {page_number}: "
+        f"{len(tables)} table region(s) detected."
+    )
+
+    page_results: list[
+        tuple[str, list[list[str]], list[tuple[int, int, int, int]]]
+    ] = []
+
+    for table_number, table in enumerate(tables, start=1):
+        crop_box = clamp_box(
+            table.box,
+            page_image.width,
+            page_image.height,
+            padding=TABLE_PADDING,
+        )
+        table_image = page_image.crop(crop_box)
+
+        if table.label == "table rotated":
+            table_image = table_image.rotate(
+                90,
+                expand=True,
+            )
+
+        table_crop_path = (
+            DEBUG_DIR
+            / f"page_{page_number}_table_{table_number}.png"
+        )
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        table_image.save(table_crop_path)
+
+        structure = engine.recognize_structure(table_image)
+        rows, columns, spans = prepare_rows_columns_and_spans(
+            structure
+        )
+
+        structure_debug_path = DEBUG_DIR / (
+            f"page_{page_number}_table_{table_number}"
+            "_structure.png"
+        )
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        save_structure_debug_image(
+            table_image,
+            rows,
+            columns,
+            spans,
+            structure_debug_path,
+        )
+
+        if not rows or not columns:
+            print(
+                f"  Skipped page {page_number} table {table_number}: "
+                "no usable row/column structure."
+            )
+            continue
+
+        data, merge_ranges = extract_grid(
+            table_image,
+            rows,
+            columns,
+            spans,
+            ocr_function,
+        )
+        data = [
+            [cleanup_extracted_cell_text(value) for value in row]
+            for row in data
+        ]
+        data, merge_ranges = prune_generated_columns(data, merge_ranges)
+        data, merge_ranges = deduplicate_adjacent_rows(data, merge_ranges)
+
+        sheet_name = f"P{page_number}_Table{table_number}"
+        page_results.append((sheet_name, data, merge_ranges))
+
+        print(
+            f"  Extracted page {page_number} table {table_number}: "
+            f"{len(rows)} row(s), {len(data[0]) if data else 0} column(s)."
+        )
+
+    return page_number, page_results
+
 def extract_tables_from_pdf(
     input_pdf: Path,
     output_xlsx: Path,
@@ -1369,6 +1931,7 @@ def extract_tables_from_pdf(
 
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
+    # One shared engine avoids concurrent from_pretrained meta-tensor crashes.
     engine = TableTransformerEngine()
     pages = render_pdf_pages(input_pdf, PDF_DPI)
 
@@ -1376,88 +1939,46 @@ def extract_tables_from_pdf(
     workbook.remove(workbook.active)
 
     extracted_table_count = 0
+    page_payloads: list[
+        tuple[int, list[tuple[str, list[list[str]], list[tuple[int, int, int, int]]]]]
+    ] = []
+    page_workers = min(effective_page_workers(), len(pages))
 
-    for page_number, page_image in enumerate(pages, start=1):
-        tables = engine.detect_tables(page_image)
-
-        print(
-            f"Page {page_number}: "
-            f"{len(tables)} table region(s) detected."
-        )
-
-        for table_number, table in enumerate(tables, start=1):
-            crop_box = clamp_box(
-                table.box,
-                page_image.width,
-                page_image.height,
-                padding=TABLE_PADDING,
-            )
-            table_image = page_image.crop(crop_box)
-
-            if table.label == "table rotated":
-                table_image = table_image.rotate(
-                    90,
-                    expand=True,
+    if page_workers <= 1:
+        for page_number, page_image in enumerate(pages, start=1):
+            page_payloads.append(
+                process_pdf_page(
+                    page_number,
+                    page_image,
+                    ocr_function,
+                    engine,
                 )
-
-            table_crop_path = (
-                DEBUG_DIR
-                / f"page_{page_number}_table_{table_number}.png"
             )
-            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-            table_image.save(table_crop_path)
-
-            structure = engine.recognize_structure(table_image)
-            rows, columns, spans = prepare_rows_columns_and_spans(
-                structure
-            )
-
-            structure_debug_path = DEBUG_DIR / (
-                f"page_{page_number}_table_{table_number}"
-                "_structure.png"
-            )
-            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-            save_structure_debug_image(
-                table_image,
-                rows,
-                columns,
-                spans,
-                structure_debug_path,
-            )
-
-            if not rows or not columns:
-                print(
-                    f"  Skipped table {table_number}: "
-                    "no usable row/column structure."
+    else:
+        print(f"Page workers: {page_workers}")
+        with ThreadPoolExecutor(max_workers=page_workers) as executor:
+            futures = [
+                executor.submit(
+                    process_pdf_page,
+                    page_number,
+                    page_image,
+                    ocr_function,
+                    engine,
                 )
-                continue
-
-            data, merge_ranges = extract_grid(
-                table_image,
-                rows,
-                columns,
-                spans,
-                ocr_function,
-            )
-            data = [
-                [cleanup_extracted_cell_text(value) for value in row]
-                for row in data
+                for page_number, page_image in enumerate(pages, start=1)
             ]
-            data, merge_ranges = prune_generated_columns(data, merge_ranges)
-            data, merge_ranges = deduplicate_adjacent_rows(data, merge_ranges)
+            for future in as_completed(futures):
+                page_payloads.append(future.result())
 
+    for _page_number, page_results in sorted(page_payloads, key=lambda item: item[0]):
+        for sheet_name, data, merge_ranges in page_results:
             write_table_sheet(
                 workbook,
-                sheet_name=f"P{page_number}_Table{table_number}",
+                sheet_name=sheet_name,
                 data=data,
                 merge_ranges=merge_ranges,
             )
-
             extracted_table_count += 1
-            print(
-                f"  Extracted table {table_number}: "
-                f"{len(rows)} row(s), {len(data[0]) if data else 0} column(s)."
-            )
 
     if extracted_table_count == 0:
         worksheet = workbook.create_sheet("No tables found")
@@ -1477,5 +1998,5 @@ if __name__ == "__main__":
     extract_tables_from_pdf(
         input_pdf=INPUT_PDF,
         output_xlsx=OUTPUT_XLSX,
-        ocr_function=default_ocr,
+        ocr_function=resolve_ocr_function(),
     )

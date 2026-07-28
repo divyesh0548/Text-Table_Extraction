@@ -10,6 +10,8 @@ import pandas as pd
 import re
 from openpyxl import load_workbook
 
+from env_config import get_input_pdf
+
 pd.set_option('display.max_rows', None)
 
 # Monkey-patch OpenCV ximgproc thresholds if missing
@@ -230,16 +232,17 @@ def extract_and_save_tables_with_dataframes(input_path, pages=None):
     return dataframes_list  # Return the list!
 
 def main():
-    # pdf_path = input("Enter the path to your PDF file: ").strip()
-    # pdf_path = "Current-Test/MBP 1 AKB 2026.pdf"
-    # pdf_path = "page_1_table_crop.png"
-    pdf_path = "Aarti - Mandays Apr 26.pdf"
+    # PDF path comes from OCR/.env (INPUT_PDF).
+    # img2table accepts PDF directly; no separate image conversion needed.
+    pdf_path = str(get_input_pdf())
 
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"Input file not found: {Path(pdf_path).resolve()}")
 
     if not (is_pdf_file(pdf_path) or is_image_file(pdf_path)):
         raise ValueError("Unsupported input format. Use PDF, PNG, JPG, JPEG, BMP, TIF, or TIFF.")
+
+    print(f"Input from .env: {Path(pdf_path).resolve()}")
 
     rotation, rotate_pages, rotation_direction = get_rotation_selection(pdf_path)
     working_pdf_path = pdf_path
