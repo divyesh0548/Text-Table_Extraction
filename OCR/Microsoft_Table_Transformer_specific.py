@@ -727,6 +727,10 @@ def tesseract_ocr(cell_image: Image.Image) -> str:
 _easyocr_reader = None
 _easyocr_lock = Lock()
 
+_LIST_MARKER_RE = re.compile(
+    r"^(?:[a-zA-Z]|[ivxlcdmIVXLCDM]+|\d+)[\.\)]$",
+)
+
 
 def get_easyocr_reader():
     """Lazy-load a shared EasyOCR reader (expensive to create)."""
@@ -747,11 +751,78 @@ def get_easyocr_reader():
     return _easyocr_reader
 
 
+def _join_easyocr_detections(results: list) -> str:
+    """
+    Rebuild cell text from EasyOCR boxes using geometry.
+
+    - Same horizontal band -> same line (space-separated, left-to-right)
+    - Different bands -> new lines (document-like layout)
+    """
+    if not results:
+        return ""
+
+    # detail=0 returns plain strings only.
+    if results and not isinstance(results[0], (list, tuple)):
+        return "\n".join(
+            " ".join(str(item).split())
+            for item in results
+            if str(item).strip()
+        ).strip()
+
+    items: list[tuple[float, float, float, str]] = []
+    for item in results:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        bbox, text = item[0], item[1]
+        cleaned = " ".join(str(text or "").split())
+        if not cleaned:
+            continue
+        try:
+            xs = [float(point[0]) for point in bbox]
+            ys = [float(point[1]) for point in bbox]
+            y_center = sum(ys) / len(ys)
+            x_center = sum(xs) / len(xs)
+            height = max(ys) - min(ys)
+        except (TypeError, ValueError, IndexError):
+            y_center, x_center, height = 0.0, float(len(items)), 10.0
+        items.append((y_center, x_center, max(height, 1.0), cleaned))
+
+    if not items:
+        return ""
+
+    items.sort(key=lambda entry: (entry[0], entry[1]))
+    median_height = float(
+        np.median([entry[2] for entry in items])
+    )
+    line_tolerance = max(8.0, median_height * 0.65)
+
+    lines: list[list[tuple[float, str]]] = []
+    line_ys: list[float] = []
+    for y_center, x_center, _height, text in items:
+        if lines and abs(y_center - line_ys[-1]) <= line_tolerance:
+            lines[-1].append((x_center, text))
+            # Keep a stable line baseline for following boxes.
+            line_ys[-1] = (line_ys[-1] * (len(lines[-1]) - 1) + y_center) / len(
+                lines[-1]
+            )
+        else:
+            lines.append([(x_center, text)])
+            line_ys.append(y_center)
+
+    assembled: list[str] = []
+    for line in lines:
+        line.sort(key=lambda entry: entry[0])
+        assembled.append(" ".join(text for _x, text in line))
+
+    return "\n".join(assembled).strip()
+
+
 def easyocr_ocr(cell_image: Image.Image) -> str:
     """
-    Cell OCR using EasyOCR (same style as OCR/EOCR.py).
+    Cell OCR using EasyOCR.
 
-    Accepts a PIL.Image.Image and returns recognized text as a string.
+    Keeps all detections and rebuilds lines from box geometry so prefixes and
+    multi-line text follow document reading order.
     """
     if cell_image.width < 2 or cell_image.height < 2:
         return ""
@@ -759,25 +830,27 @@ def easyocr_ocr(cell_image: Image.Image) -> str:
     if not cell_has_visible_ink(cell_image):
         return ""
 
-    enlarged = cell_image.resize(
-        (
-            max(2, cell_image.width * 2),
-            max(2, cell_image.height * 2),
-        ),
-        Image.Resampling.LANCZOS,
-    ).convert("RGB")
-    img_array = np.array(enlarged)
+    img_array = np.array(cell_image.convert("RGB"))
 
     reader = get_easyocr_reader()
     with _easyocr_lock:
-        results = reader.readtext(img_array, detail=0, paragraph=False)
+        results = reader.readtext(
+            img_array,
+            detail=1,
+            paragraph=False,
+            min_size=5,
+            text_threshold=0.5,
+            low_text=0.3,
+            link_threshold=0.25,
+            mag_ratio=1.5,
+            # Prefer separate nearby fragments over over-merged blobs.
+            width_ths=0.55,
+            height_ths=0.55,
+            y_ths=0.4,
+            x_ths=0.8,
+        )
 
-    lines = [
-        " ".join(str(line).split())
-        for line in results
-        if str(line).strip()
-    ]
-    return "\n".join(lines).strip()
+    return _join_easyocr_detections(results)
 
 
 def resolve_ocr_function() -> Callable[[Image.Image], str]:
@@ -817,6 +890,16 @@ def is_legitimate_placeholder(value: str | None) -> bool:
 def is_probable_ocr_noise(line: str) -> bool:
     """Identify OCR fragments without removing normal cell values."""
     if is_legitimate_placeholder(line):
+        return False
+
+    stripped = line.strip()
+    # Keep list/outline markers such as "a." / "1." / "i)".
+    if _LIST_MARKER_RE.match(stripped):
+        return False
+    if re.match(
+        r"^(?:[a-zA-Z]|[ivxlcdmIVXLCDM]+|\d+)[\.\)]\s+\S",
+        stripped,
+    ):
         return False
 
     tokens = re.findall(r"[A-Za-z0-9]+", line.lower())
@@ -935,6 +1018,11 @@ def remove_noise_symbol_patterns(text: str) -> str:
     for token in text.split():
         if is_legitimate_placeholder(token):
             cleaned_tokens.append("-" if token in {"-", "–", "—"} else token)
+            continue
+
+        # Keep list markers such as "a." / "1." / "i)".
+        if _LIST_MARKER_RE.match(token):
+            cleaned_tokens.append(token)
             continue
 
         # Drop tokens that are only noise/filler symbols.
@@ -1517,11 +1605,14 @@ def _ocr_single_grid_cell(
     if raw_box[2] <= raw_box[0] or raw_box[3] <= raw_box[1]:
         return ""
 
+    # Avoid clipping left-edge prefixes like "a." when using EasyOCR.
+    inset = 0 if str(OCR_ENGINE).strip().lower() == "easyocr" else CELL_INSET
+
     x1, y1, x2, y2 = raw_box
-    x1 = min(x2, x1 + CELL_INSET)
-    y1 = min(y2, y1 + CELL_INSET)
-    x2 = max(x1, x2 - CELL_INSET)
-    y2 = max(y1, y2 - CELL_INSET)
+    x1 = min(x2, x1 + inset)
+    y1 = min(y2, y1 + inset)
+    x2 = max(x1, x2 - inset)
+    y2 = max(y1, y2 - inset)
 
     cell_image = table_image.crop((x1, y1, x2, y2))
     raw_image = table_image.crop(raw_box)
